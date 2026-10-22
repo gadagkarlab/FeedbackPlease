@@ -42,9 +42,13 @@ public:
     virtual void writeDigital(const DigitalOutputs&) {}
     // Syllable code port (U8). Only called when the value changes.
     virtual void writeSyllableCode(uint8_t /*code*/) {}
-    // Preload feedback waveform 1 or 2 so that fireWave() starts with minimal latency.
+    // Preload feedback waveform 1, 2 or 3 so that fireWave() starts with minimal latency.
     virtual void armWave(int /*which*/) {}
     virtual void fireWave(int /*which*/) {}
+    // Level of the closed-loop pulse input line: 1 high, 0 low, -1 if there is no such input.
+    // Polled once per frame; the engine turns rising edges into triggers.
+    virtual int pollPulseInput() { return -1; }
+    // Waveform 3 is the pulse-triggered feedback (noise burst or wave file).
     // Called once per frame for housekeeping (e.g. reloading a waveform after playback).
     virtual void service() {}
     // Non-fatal output errors since the last call (empty if none).

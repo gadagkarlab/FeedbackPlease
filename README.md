@@ -315,3 +315,29 @@ given syllable. It is based on the first figure cell of the `msnFinder` notebook
 The work is done by `tools/msn_finder/msn_server.py` (numpy + scipy, no pandas), which the app starts as a child
 process using the **Python** setting; `msn_data.py` next to it is the notebook's loader. Settings are saved next
 to the `.ini` as `<name>.msn.txt`. `FeedbackPlease.exe bird.ini --msn-load` opens the tab and loads the session.
+
+## Closed-loop pulse feedback (white-noise burst)
+
+The **Closed-loop pulse feedback** section of the Live tab's left panel replaces the LabVIEW loop that waited for
+the closed loop's digital pulse and played white noise. The closed loop raises a digital line when its spike count
+crosses threshold; wire that line to a digital input of the NI card FeedbackPlease uses and enter it as **Pulse
+input line** (e.g. `Dev1/port0/line4`; not one of the output lines). A rising edge plays a burst on the **AO
+channel** (Hardware / Source), the same speaker output as Wave 1/2:
+
+```
+Gaussian white noise (unit variance) x Amplitude gain -> Butterworth bandpass (1500-8000 Hz, order 10)
+-> Delay (ms) of silence, then Duration (ms) of noise, clipped to the AO range -> finite AO write at 40 kHz
+```
+
+Defaults are the values on the LabVIEW diagram. The panel shows the expected rms after filtering (gain x
+sqrt(band / (rate/2))). **Stimulus** can also be a wave file (volts at full scale = gain). A new noise burst is
+generated after each one plays, so every trigger is different, and the next one is loaded before the pulse arrives.
+
+- The input is sampled once per 1 ms frame, so pulses must be at least 2 ms wide and add up to 1 ms of latency;
+  the burst then starts with a `DAQmxStartTask` on an already committed task, like the other feedback.
+- Pulses within **Refractory (ms)** of one that played are counted and ignored. The Live status line shows pulses
+  in and bursts played, each pulse is in the events CSV (`pulse in`, `pulse feedback`), and the feedback TTL line
+  and the red markers on the plots fire for it too.
+- **Test pulse feedback** in the toolbar plays a burst without the input, to check the speaker and levels.
+- Settings are applied at Start (the digital input and the AO waveform are built then).
+- The Closed loop tab's **Digital line** is a SpikeGLX NI output; it only reaches this input through your wiring.

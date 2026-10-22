@@ -28,6 +28,7 @@ add_library(fp_core STATIC
   src/core/FeedbackStateMachine.cpp
   src/core/Detector.cpp
   src/core/Filters.cpp
+  src/core/NoiseBurst.cpp
   src/core/Offline.cpp
   src/core/SongDetector.cpp
   src/core/SongRecorder.cpp

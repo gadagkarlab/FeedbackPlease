@@ -50,6 +50,25 @@ struct HardwareParams {
     std::string sylCodeOutput;
 };
 
+// Feedback triggered by a digital pulse on an input line (the closed loop raises one when its spike count
+// crosses threshold). Plays a bandpassed white-noise burst (or a wave file) on the AO feedback channel.
+enum class PulseSource : int { WhiteNoise = 0, WavFile = 1 };
+
+struct PulseFeedbackParams {
+    bool enabled = false;
+    std::string diLine;  // digital input carrying the pulse, e.g. Dev1/port0/line4; rising edge = trigger
+    PulseSource source = PulseSource::WhiteNoise;
+    std::string wavPath;        // for PulseSource::WavFile
+    double durationMs = 100.0;  // "Feedback Duration (ms)"
+    double delayMs = 0.0;       // "Feedback Delay (ms)": silence before the burst
+    double gain = 1.0;          // "Feedback Amplitude gain": V of unfiltered unit-variance noise (V per full-scale for a wave)
+    double lowHz = 1500.0;      // bandpass edges, Butterworth
+    double highHz = 8000.0;
+    int filterOrder = 10;
+    double aoRateHz = 40000.0;  // AO sample clock when no wave file sets it
+    double refractoryMs = 200.0;  // ignore pulses this long after one that played
+};
+
 struct SourceParams {
     SourceKind kind = SourceKind::Daq;
     std::string simWavPath;  // empty = built-in synthetic song
@@ -209,6 +228,7 @@ struct AppParams {
     FeedbackParams fb;
     SongParams song;
     SyllableCodeParams codes;
+    PulseFeedbackParams pulse;
     DisplayParams display;
     RecordingParams rec;
 };
@@ -222,6 +242,7 @@ const char* toString(BandCombination c);
 const char* toString(TriggerType t);
 const char* toString(Feedback2Mode m);
 const char* toString(SourceKind k);
+const char* toString(PulseSource s);
 const char* toString(TerminalConfig t);
 const char* toString(SongRatioMode m);
 const char* toString(SylCodeHold h);

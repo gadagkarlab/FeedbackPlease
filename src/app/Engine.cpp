@@ -287,6 +287,9 @@ void Engine::run() {
     double procAvg = 0.0, procMax = 0.0, maxBacklog = 0.0;
     uint64_t frames = 0;
     uint64_t onsets = 0, matches = 0, blocked = 0, trials = 0, fires1 = 0, fires2 = 0, suppressed = 0, catches = 0;
+    uint64_t pulseTrigs = 0, pulseFires = 0;  // closed-loop pulses seen / answered with the noise burst
+    bool pulsePrev = false;                   // pulse input level last frame (for edge detection)
+    double pulseLastMs = -1e12;
     uint64_t songBouts = 0;
     std::vector<uint64_t> codeCounts;
     std::vector<int> countedCodes;  // codes of the list the counts belong to
@@ -315,6 +318,7 @@ void Engine::run() {
         }
         if (resetCounters_.exchange(false)) {
             onsets = matches = blocked = trials = fires1 = fires2 = suppressed = catches = songBouts = 0;
+            pulseTrigs = pulseFires = 0;
             std::fill(codeCounts.begin(), codeCounts.end(), 0);
             codeUnmatched = 0;
             procMax = maxBacklog = 0.0;
@@ -324,15 +328,40 @@ void Engine::run() {
 
         // A manual test fire bypasses detection and the state machine.
         const int manual = manualFire_.exchange(0);
-        if (manual) {
+        if (manual == 1 || manual == 2) {
             r.fb.arm = 0;
             r.fb.fire = manual;
+        }
+
+        // Closed-loop pulse: a rising edge on the input line plays the noise burst (wave 3). A trigger that
+        // arrives within the refractory period of the last one is counted but ignored. Manual test = 3.
+        int pulseFire = manual == 3 ? 3 : 0;
+        bool pulseEdge = false, pulseIgnored = false;
+        const int pulseLevel = io_->pollPulseInput();
+        if (pulseLevel >= 0) {
+            pulseEdge = pulseLevel == 1 && !pulsePrev;
+            pulsePrev = pulseLevel == 1;
+        }
+        if (pulseEdge) {
+            ++pulseTrigs;
+            if (p.pulse.enabled) {
+                if (r.tMs - pulseLastMs >= p.pulse.refractoryMs) {
+                    pulseFire = 3;
+                    pulseLastMs = r.tMs;
+                } else {
+                    pulseIgnored = true;
+                }
+            }
         }
 
         // ---- outputs first, bookkeeping after
         if (r.fb.arm) io_->armWave(r.fb.arm);
         if (r.fb.fire) {
             io_->fireWave(r.fb.fire);
+            fbPulseLeftMs = std::max(p.fb.ttlPulseMs, frameMs);
+        }
+        if (pulseFire) {
+            io_->fireWave(3);
             fbPulseLeftMs = std::max(p.fb.ttlPulseMs, frameMs);
         }
         if (r.match.match) matchPulseLeftMs = std::max(p.fb.ttlPulseMs, frameMs);
@@ -422,6 +451,11 @@ void Engine::run() {
             (r.fb.fire == 1 ? fires1 : fires2)++;
             logEvent(t, r.fb.fire == 1 ? "feedback1" : "feedback2", manual ? "manual" : "", r.value);
         }
+        if (pulseEdge) logEvent(t, "pulse in", pulseIgnored ? "ignored (refractory)" : p.pulse.enabled ? "" : "ignored (pulse feedback off)", r.value);
+        if (pulseFire) {
+            ++pulseFires;
+            logEvent(t, "pulse feedback", manual == 3 ? "manual" : fmt("delay %.0f ms, %.0f ms", p.pulse.delayMs, p.pulse.durationMs), r.value);
+        }
         if (r.fb.suppressed) {
             ++suppressed;
             logEvent(t, "suppressed", fmt("feedback %.0f below detect-signal threshold", r.fb.suppressed), r.value);
@@ -445,7 +479,7 @@ void Engine::run() {
             songOn_.push(r.song.active ? 1.0f : 0.0f);
             const double ts = t / 1000.0;
             if (r.match.match) (r.matchBlocked ? blockedT_ : matchT_).push_back(ts);
-            if (r.fb.fire) fireT_.push_back(ts);
+            if (r.fb.fire || pulseFire) fireT_.push_back(ts);
             if (r.fb.suppressed) suppressT_.push_back(ts);
             for (auto* q : {&matchT_, &fireT_, &suppressT_, &blockedT_})
                 while (!q->empty() && q->front() < ts - kScopeSeconds) q->pop_front();
@@ -483,6 +517,9 @@ void Engine::run() {
             s.fires2 = fires2;
             s.suppressed = suppressed;
             s.catches = catches;
+            s.pulseTrigs = pulseTrigs;
+            s.pulseFires = pulseFires;
+            s.pulseInput = pulsePrev;
         }
     }
 

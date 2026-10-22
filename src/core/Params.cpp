@@ -71,6 +71,19 @@ void visitParams(AppParams& p, F&& f) {
     f("fb.extra_delay_ms", p.fb.extraDelayMs);
     f("fb.ttl_pulse_ms", p.fb.ttlPulseMs);
 
+    f("pulse.enabled", p.pulse.enabled);
+    f("pulse.di_line", p.pulse.diLine);
+    f("pulse.source", p.pulse.source);
+    f("pulse.wav_path", p.pulse.wavPath);
+    f("pulse.duration_ms", p.pulse.durationMs);
+    f("pulse.delay_ms", p.pulse.delayMs);
+    f("pulse.gain", p.pulse.gain);
+    f("pulse.low_hz", p.pulse.lowHz);
+    f("pulse.high_hz", p.pulse.highHz);
+    f("pulse.filter_order", p.pulse.filterOrder);
+    f("pulse.ao_rate_hz", p.pulse.aoRateHz);
+    f("pulse.refractory_ms", p.pulse.refractoryMs);
+
     f("song.enabled", p.song.enabled);
     f("song.gate_feedback", p.song.gateFeedback);
     f("song.mean_subtract", p.song.meanSubtract);
@@ -297,6 +310,14 @@ const char* toString(Feedback2Mode m) {
     switch (m) {
         case Feedback2Mode::Alternative: return "Alternative to feedback 1";
         case Feedback2Mode::AfterFeedback1: return "Follows feedback 1";
+    }
+    return "?";
+}
+
+const char* toString(PulseSource s) {
+    switch (s) {
+        case PulseSource::WhiteNoise: return "White noise";
+        case PulseSource::WavFile: return "Wave file";
     }
     return "?";
 }

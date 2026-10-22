@@ -6,6 +6,7 @@
 #include <filesystem>
 
 #include "app/Widgets.h"
+#include "core/NoiseBurst.h"
 #include "imgui.h"
 #include "imgui_stdlib.h"
 #include "implot.h"
@@ -206,6 +207,8 @@ void Gui::drawToolbar() {
     ImGui::SameLine();
     if (ImGui::Button("Test feedback 2")) engine_.manualFire(2);
     ImGui::SameLine();
+    if (ImGui::Button("Test pulse feedback")) engine_.manualFire(3);
+    ImGui::SameLine();
     if (ImGui::Button("Reset counters")) engine_.resetCounters();
     ImGui::EndDisabled();
 
@@ -291,6 +294,7 @@ void Gui::drawControls() {
     if (ImGui::CollapsingHeader("Processing Params")) drawProcessing();
     if (ImGui::CollapsingHeader("Song Detection (DetectBirdSong)")) drawSong();
     if (ImGui::CollapsingHeader("Feedback", open)) drawFeedback();
+    if (ImGui::CollapsingHeader("Closed-loop pulse feedback", open)) drawPulseFeedback();
     if (ImGui::CollapsingHeader("Hardware / Source")) drawHardware();
     if (ImGui::CollapsingHeader("Recording")) drawRecording();
     if (ImGui::CollapsingHeader("Display")) drawDisplay();
@@ -471,6 +475,57 @@ void Gui::drawFeedback() {
     InputD("Feedback Delay (ms)", &p_.fb.extraDelayMs, "%.4g");
     HelpMarker("Added to Delay 1 (and to Delay 2 in Alternative mode).");
     InputD("TTL pulse (ms)", &p_.fb.ttlPulseMs, "%.4g");
+}
+
+// A digital pulse on an input line (raised by the closed loop when its spike count crosses threshold) plays a
+// bandpassed white-noise burst on the AO feedback channel: LabVIEW's "read the pulse, make white noise" loop.
+void Gui::drawPulseFeedback() {
+    auto& q = p_.pulse;
+    const bool running = engine_.running();
+    ImGui::TextWrapped("A rising edge on the input line plays a noise burst on the AO channel (Hardware / Source). "
+                       "Wire the closed loop's digital output line to this input.");
+    if (running) ImGui::TextColored(kAmber, "Stop acquisition to change these settings.");
+    ImGui::BeginDisabled(running);  // applied at Start: the DI task and the AO waveform are built then
+    Check("Enabled", &q.enabled);
+    InputStr("Pulse input line", &q.diLine, 12);
+    HelpMarker("Digital input that receives the pulse, e.g. Dev1/port0/line4. Sampled once per 1 ms frame, so the "
+               "pulse must be at least 2 ms wide. Must not be one of the output lines above.");
+    EnumCombo("Stimulus", &q.source, 2, 10);
+    if (q.source == PulseSource::WavFile) {
+        PathInput("Wave file", &q.wavPath, 15);
+        HelpMarker("Played instead of noise. Its sample rate sets the AO rate and must match the Wave 1/2 files if those are used.");
+    }
+    InputD("Duration (ms)", &q.durationMs, "%.4g", 6);
+    q.durationMs = std::clamp(q.durationMs, 1.0, 5000.0);
+    HelpMarker("Length of the noise burst (Feedback Duration in LabVIEW).");
+    InputD("Delay (ms)", &q.delayMs, "%.4g", 6);
+    q.delayMs = std::clamp(q.delayMs, 0.0, 5000.0);
+    HelpMarker("Silence between the pulse and the start of the burst (Feedback Delay in LabVIEW). Timed on the AO clock.");
+    InputD("Amplitude gain", &q.gain, "%.4g", 6);
+    q.gain = std::max(0.0, q.gain);
+    if (q.source == PulseSource::WhiteNoise) {
+        const double rate = running ? stats_.sampleRate : q.aoRateHz;
+        ImGui::SameLine();
+        ImGui::TextDisabled("~%.2f V rms", expectedNoiseRms(q, q.aoRateHz > 0 ? q.aoRateHz : rate));
+        HelpMarker("Standard deviation (V) of the unfiltered white noise; the bandpass lowers it (the figure shown is the "
+                   "expected rms after filtering). Output is clipped to the AO range. For a wave file: volts at full scale.");
+        InputD("Band low (Hz)", &q.lowHz, "%.5g", 6);
+        InputD("Band high (Hz)", &q.highHz, "%.5g", 6);
+        InputI("Filter order", &q.filterOrder, 6);
+        q.filterOrder = std::clamp(q.filterOrder, 1, 20);
+        HelpMarker("Butterworth bandpass, LabVIEW's order convention (order N = 2N poles).");
+        InputD("AO rate (Hz)", &q.aoRateHz, "%.0f", 6);
+        q.aoRateHz = std::max(1000.0, q.aoRateHz);
+        HelpMarker("AO sample clock for the burst (LabVIEW: 40000). If Wave 1/2 files are loaded, their rate is used instead.");
+        if (!(q.lowHz > 0 && q.highHz > q.lowHz && q.highHz < q.aoRateHz / 2))
+            ImGui::TextColored(kRed, "Band must satisfy 0 < low < high < rate/2.");
+    }
+    InputD("Refractory (ms)", &q.refractoryMs, "%.4g", 6);
+    q.refractoryMs = std::max(0.0, q.refractoryMs);
+    HelpMarker("Pulses within this time of one that played are counted but ignored.");
+    if (q.enabled && p_.hw.aoChannel.empty()) ImGui::TextColored(kRed, "Set the AO channel under Hardware / Source.");
+    if (q.enabled && q.diLine.empty()) ImGui::TextColored(kRed, "Set the pulse input line.");
+    ImGui::EndDisabled();
 }
 
 void Gui::drawCodes() {
@@ -759,6 +814,10 @@ void Gui::drawStatus() {
                 (unsigned long long)s.blocked, (unsigned long long)s.trials, (unsigned long long)s.fires1,
                 (unsigned long long)s.fires2, (unsigned long long)s.suppressed, (unsigned long long)s.catches,
                 (unsigned long long)s.songBouts);
+    if (p_.pulse.enabled) {
+        ImGui::TextColored(s.pulseInput ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "closed-loop pulses in %llu  noise bursts played %llu%s",
+                           (unsigned long long)s.pulseTrigs, (unsigned long long)s.pulseFires, s.pulseInput ? "   (input HIGH)" : "");
+    }
 }
 
 void Gui::drawPlots(float height) {

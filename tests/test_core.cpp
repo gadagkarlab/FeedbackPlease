@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -13,6 +14,7 @@
 #include "core/Detector.h"
 #include "core/FeedbackStateMachine.h"
 #include "core/Filters.h"
+#include "core/NoiseBurst.h"
 #include "core/Offline.h"
 #include "core/WavFile.h"
 #include "core/Params.h"
@@ -488,12 +490,82 @@ static void testSongFiles() {
     std::remove("fp_songtest_songs.csv");
 }
 
+static void testNoiseBurst() {
+    const double fs = 40000.0;
+    PulseFeedbackParams p;  // LabVIEW defaults: 1500-8000 Hz, order 10
+    p.durationMs = 200;
+    p.delayMs = 10;
+    p.gain = 1.0;
+    std::string err;
+    auto x = makeNoiseBurst(p, fs, -10, 10, 1, &err);
+    CHECK(err.empty());
+    CHECK(x.size() == size_t(210.0 * fs / 1000.0));
+    const size_t nDelay = size_t(10.0 * fs / 1000.0);
+    bool silent = true;
+    for (size_t i = 0; i < nDelay; ++i) silent = silent && x[i] == 0.0;
+    CHECK(silent);  // the delay is silence
+
+    // Power inside the band vs. well outside it (FFT of the noise part).
+    const int nfft = 8192;
+    std::vector<std::complex<double>> spec(nfft);
+    for (int i = 0; i < nfft; ++i) spec[size_t(i)] = x[nDelay + size_t(i)];
+    fftInPlace(spec);
+    double inBand = 0, below = 0, above = 0;
+    int nIn = 0, nBelow = 0, nAbove = 0;
+    for (int k = 1; k < nfft / 2; ++k) {
+        const double f = k * fs / nfft, pw = std::norm(spec[size_t(k)]);
+        if (f > 2500 && f < 7000) { inBand += pw; ++nIn; }
+        else if (f < 500) { below += pw; ++nBelow; }
+        else if (f > 10000) { above += pw; ++nAbove; }
+    }
+    CHECK(inBand / nIn > 100 * below / nBelow);
+    CHECK(inBand / nIn > 100 * above / nAbove);
+
+    // rms is close to gain * sqrt(band fraction)
+    double ss = 0;
+    for (size_t i = nDelay + 2000; i < x.size(); ++i) ss += x[i] * x[i];
+    const double rms = std::sqrt(ss / double(x.size() - nDelay - 2000));
+    CHECK(std::fabs(rms - expectedNoiseRms(p, fs)) < 0.1 * expectedNoiseRms(p, fs));
+
+    // linear in gain, different every call, clipped to the output range
+    PulseFeedbackParams p2 = p;
+    p2.gain = 2.0;
+    auto y = makeNoiseBurst(p2, fs, -10, 10, 1);
+    CHECK(std::fabs(y[nDelay + 1000] - 2.0 * x[nDelay + 1000]) < 1e-3);
+    CHECK(makeNoiseBurst(p, fs, -10, 10, 2) != x);
+    p2.gain = 100.0;
+    auto z = makeNoiseBurst(p2, fs, -1, 1, 1);
+    double zmax = 0;
+    for (double v : z) zmax = std::max(zmax, std::fabs(v));
+    CHECK(zmax == 1.0);
+
+    // a band that does not fit the sample rate is rejected
+    p2 = p;
+    p2.highHz = 30000;
+    CHECK(makeNoiseBurst(p2, fs, -10, 10, 1, &err).empty() && !err.empty());
+
+    // wave file: delay, then samples x gain
+    p2 = p;
+    p2.gain = 2.0;
+    auto w = makeWaveBurst({0.25f, -0.5f, 1.0f}, fs, p2, -10, 10);
+    CHECK(w.size() == nDelay + 3 && w[nDelay] == 0.5 && w[nDelay + 1] == -1.0 && w[nDelay + 2] == 2.0 && w[0] == 0.0);
+}
+
 static void testParamsRoundTrip() {
     AppParams a;
     a.hw.aiChannel = "PXI1Slot2/ai3";
     a.spectrum.include[2] = {2.5, 300, 900};
     a.fb.wave1 = "C:\\stim\\noise #1.wav";
     a.codes.list = {makeCode("A #1", 1, TriggerType::IOI, 90, 0, 0)};
+    a.pulse.enabled = true;
+    a.pulse.diLine = "Dev1/port0/line4";
+    a.pulse.source = PulseSource::WavFile;
+    a.pulse.durationMs = 75;
+    a.pulse.delayMs = 12.5;
+    a.pulse.gain = 2.25;
+    a.pulse.lowHz = 1200;
+    a.pulse.highHz = 9000;
+    a.pulse.filterOrder = 6;
     a.codes.target = 1;
     SyllableCode c2 = makeCode("B", 17, TriggerType::IOI_SD_IOI, 124, 91, 95, 7);
     c2.mode = RangeMode::MinMax;
@@ -505,6 +577,9 @@ static void testParamsRoundTrip() {
     CHECK(b.hw.aiChannel == a.hw.aiChannel);
     CHECK(b.spectrum.include[2].gain == 2.5 && b.spectrum.include[2].highHz == 900);
     CHECK(b.fb.wave1 == a.fb.wave1);
+    CHECK(b.pulse.enabled && b.pulse.diLine == a.pulse.diLine && b.pulse.source == PulseSource::WavFile);
+    CHECK(b.pulse.durationMs == 75 && b.pulse.delayMs == 12.5 && b.pulse.gain == 2.25 && b.pulse.lowHz == 1200 &&
+          b.pulse.highHz == 9000 && b.pulse.filterOrder == 6);
     CHECK(b.codes.list.size() == 2 && b.codes.target == 1);
     CHECK(!b.codes.list.empty() && b.codes.list[0].name == "A #1");  // '#' survives in names
     if (b.codes.list.size() == 2) {

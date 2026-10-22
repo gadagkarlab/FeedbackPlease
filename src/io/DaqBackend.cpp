@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <vector>
 
+#include "core/NoiseBurst.h"
 #include "core/WavFile.h"
 
 namespace fp {
@@ -42,7 +43,7 @@ public:
     bool start(const AppParams& p, std::string& err) override {
         stop();
         fs_ = p.hw.sampleRate;
-        const bool ok = startAI(p, err) && startDO(p, err) && startCode(p, err) && startAO(p, err) &&
+        const bool ok = startAI(p, err) && startDO(p, err) && startCode(p, err) && startAO(p, err) && startPulseInput(p, err) &&
                         check(DAQmxStartTask(ai_), "DAQmxStartTask(AI)", err);
         if (!ok) stop();
         return ok;
@@ -54,6 +55,11 @@ public:
             DAQmxStopTask(do_);
             DAQmxClearTask(do_);
             do_ = 0;
+        }
+        if (di_) {
+            DAQmxStopTask(di_);
+            DAQmxClearTask(di_);
+            di_ = 0;
         }
         if (code_) {
             writeSyllableCode(0);
@@ -75,8 +81,9 @@ public:
         lastDo_ = DigitalOutputs{};
         aoLoaded_ = aoPending_ = 0;
         aoStarted_ = false;
-        waves_[0].clear();
-        waves_[1].clear();
+        for (auto& w : waves_) w.clear();
+        aoLen_ = 0;
+        noiseSpent_ = false;
     }
 
     void zeroAO() {
@@ -133,6 +140,18 @@ public:
         if (DAQmxFailed(c)) outErr_ = daqError(c, "DAQmxWriteDigitalU8 (syllable code)");
     }
 
+    int pollPulseInput() override {
+        if (!di_) return -1;
+        uInt8 v = 0;
+        int32 read = 0, bytes = 0;
+        const int32 code = DAQmxReadDigitalLines(di_, 1, 1.0, DAQmx_Val_GroupByChannel, &v, 1, &read, &bytes, nullptr);
+        if (DAQmxFailed(code)) {
+            outErr_ = daqError(code, "DAQmxReadDigitalLines (pulse input)");
+            return -1;
+        }
+        return v ? 1 : 0;
+    }
+
     void armWave(int w) override {
         if (!hasWave(w)) return;
         if (aoBusy()) {
@@ -156,9 +175,14 @@ public:
         }
         aoStarted_ = true;
         aoPending_ = 0;
+        if (w == 3) noiseSpent_ = true;  // a fresh burst is generated once this one has finished
     }
 
     void service() override {
+        if (noiseSpent_ && !aoBusy()) {  // new noise for the next trigger, ready before it arrives
+            noiseSpent_ = false;
+            if (regenerateBurst() && aoLoaded_ == 3) loadWave(3);
+        }
         if (aoPending_ && !aoBusy()) {
             if (aoLoaded_ != aoPending_) loadWave(aoPending_);
             aoPending_ = 0;
@@ -245,37 +269,76 @@ private:
         return outErr_.empty() || (err = outErr_, false);
     }
 
+    bool startPulseInput(const AppParams& p, std::string& err) {
+        if (!p.pulse.enabled || p.pulse.diLine.empty()) return true;
+        return check(DAQmxCreateTask("FeedbackPlease_DI", &di_), "DAQmxCreateTask(DI)", err) &&
+               check(DAQmxCreateDIChan(di_, p.pulse.diLine.c_str(), "", DAQmx_Val_ChanForAllLines), "DAQmxCreateDIChan(pulse input)",
+                     err) &&
+               check(DAQmxStartTask(di_), "DAQmxStartTask(DI)", err);
+    }
+
+    // Three waveforms share one finite AO task: wave files 1 and 2 (syllable-triggered feedback) and, as 3, the
+    // burst played when a closed-loop pulse arrives. Everything is padded to the longest.
     bool startAO(const AppParams& p, std::string& err) {
         const auto& hw = p.hw;
         const std::string* paths[2] = {&p.fb.wave1, &p.fb.wave2};
-        if (hw.aoChannel.empty() || (paths[0]->empty() && paths[1]->empty())) return true;
+        const bool pulseOn = p.pulse.enabled && !p.pulse.diLine.empty();
+        const bool pulseWav = pulseOn && p.pulse.source == PulseSource::WavFile;
+        if (hw.aoChannel.empty() || (paths[0]->empty() && paths[1]->empty() && !pulseOn)) return true;
 
         double rate = 0.0;
         size_t len = 0;
+        auto setRate = [&](double r, const std::string& what) {
+            if (rate != 0.0 && r != rate) {
+                err = what + " must have the same sample rate as the other feedback wave files";
+                return false;
+            }
+            rate = r;
+            return true;
+        };
         for (int i = 0; i < 2; ++i) {
             if (paths[i]->empty()) continue;
             WavData w;
             if (!readWav(*paths[i], w, &err)) return false;
-            if (rate != 0.0 && w.sampleRate != rate) {
-                err = "feedback wave files must have the same sample rate";
-                return false;
-            }
-            rate = w.sampleRate;
+            if (!setRate(w.sampleRate, "feedback wave files")) return false;
             waves_[i].resize(w.samples.size());
             for (size_t k = 0; k < w.samples.size(); ++k)
                 waves_[i][k] = std::clamp(double(w.samples[k]) * hw.aoScale, hw.aoMin, hw.aoMax);
             len = std::max(len, waves_[i].size());
         }
-        // Both waves share one finite task, so pad to a common length. Trailing zeros
-        // leave the output at 0 V when playback ends.
+
+        aoMin_ = hw.aoMin;
+        aoMax_ = hw.aoMax;
+        if (pulseOn) {
+            pulse_ = p.pulse;
+            if (pulseWav) {
+                if (p.pulse.wavPath.empty()) {
+                    err = "pulse feedback: choose a wave file or switch the source to white noise";
+                    return false;
+                }
+                WavData w;
+                if (!readWav(p.pulse.wavPath, w, &err)) return false;
+                if (!setRate(w.sampleRate, "the pulse feedback wave file")) return false;
+                waves_[2] = makeWaveBurst(w.samples, rate, p.pulse, hw.aoMin, hw.aoMax);
+            } else {
+                if (rate == 0.0) rate = p.pulse.aoRateHz;  // else: noise is made at the wave files' rate
+                burstRate_ = rate;
+                if (!regenerateBurst()) {
+                    err = "pulse feedback: " + outErr_;
+                    outErr_.clear();
+                    return false;
+                }
+            }
+            len = std::max(len, waves_[2].size());
+        }
+        // Pad to a common length. Trailing zeros leave the output at 0 V when playback ends.
         len += 16;
         for (auto& w : waves_)
             if (!w.empty()) w.resize(len, 0.0);
         aoLen_ = len;
         aoChannel_ = hw.aoChannel;
-        aoMin_ = hw.aoMin;
-        aoMax_ = hw.aoMax;
 
+        auto first = [&] { return !waves_[0].empty() ? 1 : !waves_[1].empty() ? 2 : 3; };
         return check(DAQmxCreateTask("FeedbackPlease_AO", &ao_), "DAQmxCreateTask(AO)", err) &&
                check(DAQmxCreateAOVoltageChan(ao_, hw.aoChannel.c_str(), "", hw.aoMin, hw.aoMax, DAQmx_Val_Volts,
                                               nullptr),
@@ -285,11 +348,25 @@ private:
                // Every write replaces the whole buffer from sample 0.
                check(DAQmxSetWriteRelativeTo(ao_, DAQmx_Val_FirstSample), "DAQmxSetWriteRelativeTo", err) &&
                check(DAQmxSetWriteOffset(ao_, 0), "DAQmxSetWriteOffset", err) &&
-               (loadWave(hasWave(1) ? 1 : 2) || (err = outErr_, false)) &&
+               (loadWave(first()) || (err = outErr_, false)) &&
                check(DAQmxTaskControl(ao_, DAQmx_Val_Task_Commit), "DAQmxTaskControl(commit AO)", err);
     }
 
-    bool hasWave(int w) const { return ao_ && (w == 1 || w == 2) && !waves_[w - 1].empty(); }
+    // New white-noise burst into waves_[2] (padded to the task length once the task exists).
+    bool regenerateBurst() {
+        if (pulse_.source != PulseSource::WhiteNoise) return true;
+        std::string e;
+        std::vector<double> b = makeNoiseBurst(pulse_, burstRate_, aoMin_, aoMax_, ++burstSeed_ * 2654435761u + 12345u, &e);
+        if (b.empty() && !e.empty()) {
+            outErr_ = e;
+            return false;
+        }
+        if (aoLen_ > 0) b.resize(aoLen_, 0.0);
+        waves_[2] = std::move(b);
+        return true;
+    }
+
+    bool hasWave(int w) const { return ao_ && w >= 1 && w <= 3 && !waves_[w - 1].empty(); }
 
     bool aoBusy() {
         if (!aoStarted_) return false;
@@ -314,7 +391,7 @@ private:
         return true;
     }
 
-    TaskHandle ai_ = 0, do_ = 0, ao_ = 0, code_ = 0;
+    TaskHandle ai_ = 0, do_ = 0, ao_ = 0, code_ = 0, di_ = 0;
     double fs_ = 40000.0;
     std::vector<float64> buf_;
 
@@ -322,7 +399,11 @@ private:
     int doCount_ = 0;
     DigitalOutputs lastDo_;
 
-    std::vector<float64> waves_[2];
+    std::vector<float64> waves_[3];
+    PulseFeedbackParams pulse_;
+    double burstRate_ = 40000.0;
+    uint32_t burstSeed_ = 0;
+    bool noiseSpent_ = false;
     size_t aoLen_ = 0;
     std::string aoChannel_;
     double aoMin_ = -10.0, aoMax_ = 10.0;

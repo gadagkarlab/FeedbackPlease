@@ -45,6 +45,8 @@ struct EngineStats {
     FbState fbState = FbState::Listening;
     uint64_t onsets = 0, matches = 0, blocked = 0, trials = 0, fires1 = 0, fires2 = 0, suppressed = 0, catches = 0;
     uint64_t songBouts = 0;
+    uint64_t pulseTrigs = 0, pulseFires = 0;  // closed-loop pulses seen / answered with the burst
+    bool pulseInput = false;                  // pulse input line is high now
     int songFilesDone = 0;      // song-triggered WAVs finished this session
     bool songFileOpen = false;  // a song-triggered WAV is being written now
     int currentCode = 0;               // value on the syllable code port now

@@ -40,6 +40,7 @@ private:
     void drawProcessing();
     void drawTarget();
     void drawFeedback();
+    void drawPulseFeedback();
     void drawSong();
     void drawCodes();
     void drawRecording();
