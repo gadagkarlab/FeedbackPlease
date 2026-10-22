@@ -37,10 +37,26 @@ Gui::Gui(std::string settingsPath) : settingsPath_(std::move(settingsPath)) {
             status_ = "Settings: " + err;
     }
     if (!daqAvailable()) p_.source.kind = SourceKind::Simulated;
+#ifdef FP_CLOSEDLOOP
+    std::string clStatus;
+    closed_.load(closedLoopPath(), &clStatus);
+    if (status_.empty()) status_ = clStatus;
+#endif
+#ifdef FP_MSN
+    msn_.load(msnPath(), nullptr);
+#endif
 }
 
 Gui::~Gui() {
     engine_.stop();
+#ifdef FP_CLOSEDLOOP
+    closed_.shutdown();
+    closed_.save(closedLoopPath());
+#endif
+#ifdef FP_MSN
+    msn_.shutdown();
+    msn_.save(msnPath());
+#endif
     saveParams(settingsPath_, p_);
 }
 
@@ -56,6 +72,20 @@ void Gui::openTune(const std::string& folder, bool analyze, bool summary) {
     tune_.openFolder(folder, analyze || summary, p_, summary);
     selectTuneTab_ = true;
 }
+
+std::string Gui::closedLoopPath() const {
+    std::string base = settingsPath_;
+    if (base.size() > 4 && base.compare(base.size() - 4, 4, ".ini") == 0) base.resize(base.size() - 4);
+    return base + ".closedloop.txt";
+}
+
+#ifdef FP_MSN
+std::string Gui::msnPath() const {
+    std::string base = settingsPath_;
+    if (base.size() > 4 && base.compare(base.size() - 4, 4, ".ini") == 0) base.resize(base.size() - 4);
+    return base + ".msn.txt";
+}
+#endif
 
 void Gui::pushParams() {
     if (engine_.running()) engine_.updateParams(p_);
@@ -75,12 +105,33 @@ void Gui::draw() {
     ImGui::Separator();
 
     ImGui::BeginChild("controls", ImVec2(31.0f * em(), 0), ImGuiChildFlags_Border);
-    drawControls();
+    // The left panel follows the tab. Edits in the closed-loop and MSN panels are not engine parameters,
+    // so they must not trigger a parameter push.
+    const bool beforeChanged = changed();
+    if (false) {
+    }
+#ifdef FP_CLOSEDLOOP
+    else if (activeTab_ == 2) {
+        closed_.drawParams();
+        changed() = beforeChanged;
+    }
+#endif
+#ifdef FP_MSN
+    else if (activeTab_ == 3) {
+        msn_.drawParams();
+        changed() = beforeChanged;
+    }
+#endif
+    else {
+        drawControls();
+    }
     ImGui::EndChild();
     ImGui::SameLine();
     ImGui::BeginChild("right");
     if (ImGui::BeginTabBar("views")) {
+        int tab = activeTab_;
         if (ImGui::BeginTabItem("Live")) {
+            tab = 0;
             drawStatus();
             const float h = ImGui::GetContentRegionAvail().y;
             drawPlots(h * 0.80f);
@@ -88,9 +139,35 @@ void Gui::draw() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Tune on recordings", nullptr, selectTuneTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
+            tab = 1;
             tune_.draw(p_, editSyl_);
             ImGui::EndTabItem();
         }
+#ifdef FP_CLOSEDLOOP
+        {
+            const std::string label =
+                std::string("Closed loop") + (closed_.state() == ClosedLoopRunner::State::Live ? " [live]" : "") + "###cltab";
+            if (ImGui::BeginTabItem(label.c_str(), nullptr, selectClTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
+                tab = 2;
+                const bool before = changed();
+                closed_.drawMain();
+                changed() = before;
+                ImGui::EndTabItem();
+            }
+        }
+        selectClTab_ = false;
+#endif
+#ifdef FP_MSN
+        if (ImGui::BeginTabItem("MSN finder", nullptr, selectMsnTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
+            tab = 3;
+            const bool before = changed();
+            msn_.drawMain();
+            changed() = before;
+            ImGui::EndTabItem();
+        }
+        selectMsnTab_ = false;
+#endif
+        activeTab_ = tab;
         selectTuneTab_ = false;
         ImGui::EndTabBar();
     }
@@ -138,6 +215,12 @@ void Gui::drawToolbar() {
     if (ImGui::Button("Save")) {
         std::string e;
         status_ = saveParams(settingsPath_, p_, &e) ? "Saved " + settingsPath_ : e;
+#ifdef FP_CLOSEDLOOP
+        if (!closed_.save(closedLoopPath(), &e)) status_ = e;
+#endif
+#ifdef FP_MSN
+        if (!msn_.save(msnPath(), &e)) status_ = e;
+#endif
     }
     ImGui::SameLine();
     if (ImGui::Button("Save as...")) {
@@ -147,6 +230,12 @@ void Gui::drawToolbar() {
             if (saveParams(f, p_, &e)) {
                 settingsPath_ = f;
                 status_ = "Saved " + f;
+#ifdef FP_CLOSEDLOOP
+                if (!closed_.save(closedLoopPath(), &e)) status_ = e;
+#endif
+#ifdef FP_MSN
+                if (!msn_.save(msnPath(), &e)) status_ = e;
+#endif
             } else {
                 status_ = e;
             }
@@ -163,6 +252,14 @@ void Gui::drawToolbar() {
                 p_ = np;
                 settingsPath_ = f;
                 status_ = "Loaded " + f;
+#ifdef FP_CLOSEDLOOP
+                closed_.reset();
+                closed_.load(closedLoopPath(), &status_);
+#endif
+#ifdef FP_MSN
+                msn_.reset();
+                msn_.load(msnPath());
+#endif
             } else {
                 status_ = "Load failed: " + e;
             }
@@ -170,6 +267,15 @@ void Gui::drawToolbar() {
     }
     ImGui::EndDisabled();
 
+#ifdef FP_CLOSEDLOOP
+    {
+        const std::string cl = closed_.statusText();
+        if (!cl.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(closed_.state() == ClosedLoopRunner::State::Live ? kGreen : kAmber, "| %s", cl.c_str());
+        }
+    }
+#endif
     ImGui::SameLine();
     const bool bad = status_.find("fail") != std::string::npos || status_.rfind("Stopped:", 0) == 0;
     ImGui::TextColored(bad ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "%s", status_.c_str());
@@ -558,7 +664,17 @@ void Gui::drawRecording() {
     auto& r = p_.rec;
     const bool running = engine_.running();
     ImGui::BeginDisabled(running);  // all of this is applied at Start
-    InputStr("Output folder", &r.outputDir, 14);
+    InputStr("##outdir", &r.outputDir, 12);
+    ImGui::SameLine();
+    if (ImGui::Button("...##outdir")) {
+        const std::string f = pickFolderDialog("Recording output folder");
+        if (!f.empty()) {
+            r.outputDir = f;
+            changed() = true;
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted("Output folder");
     Check("Events CSV", &r.saveEvents);
     Check("Continuous detection signal WAV (frame rate)", &r.saveEnvelope);
 

@@ -4,3 +4,7 @@ feedbackplease.ini
 feedbackplease_crash.txt
 *.user
 .vs/
+*.closedloop.txt
+*.msn.txt
+__pycache__/
+tools/msn_finder/cache/

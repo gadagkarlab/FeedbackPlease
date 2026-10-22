@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(FP_BUILD_GUI "Build the FeedbackPlease GUI (fetches GLFW, Dear ImGui, ImPlot)" ON)
 option(FP_WITH_DAQMX "Use NI-DAQmx if it is installed" ON)
+option(FP_WITH_CLOSEDLOOP "Build the spike-triggered closed-loop tab (needs the SpikeGLX SDK, Windows)" ON)
+set(SGLX_SDK_DIR "${CMAKE_SOURCE_DIR}/../LiveSorter_BF/SDK/API"
+    CACHE PATH "SpikeGLX SDK API folder (SglxCppClient.cpp, SglxApi.h, libSglxApi.a, SglxApi.dll)")
+set(CLOSEDLOOP_FILTERGEN_DIR "${CMAKE_SOURCE_DIR}/../LiveSorter_BF/FilterGen"
+    CACHE PATH "Folder holding calibrate_for_closedloop.py (the default calibration script)")
 set(NIDAQMX_ROOT "C:/Program Files (x86)/National Instruments/Shared/ExternalCompilerSupport/C"
     CACHE PATH "NI-DAQmx ANSI C support folder (contains include/ and lib64/)")
 
@@ -103,6 +108,48 @@ if(FP_BUILD_GUI)
   add_executable(FeedbackPlease src/app/main.cpp src/app/Gui.cpp src/app/Widgets.cpp src/app/TuneView.cpp
     src/app/CrashHandler.cpp)
   target_link_libraries(FeedbackPlease PRIVATE fp_engine imgui_lib)
+
+  # MSN finder tab: drives tools/msn_finder/msn_server.py (numpy + scipy) as a child process.
+  if(WIN32)
+    target_sources(FeedbackPlease PRIVATE src/app/MsnFinder.cpp src/app/MsnFinderView.cpp)
+    target_compile_definitions(FeedbackPlease PRIVATE FP_MSN
+      "FP_MSN_DEFAULT_SCRIPT=\"${CMAKE_SOURCE_DIR}/tools/msn_finder/msn_server.py\"")
+  endif()
+
+  # Closed-loop tab: the ClosedLoop spike detector, ported into src/closedloop. Optional so the
+  # rest builds on machines without the SpikeGLX SDK.
+  if(FP_WITH_CLOSEDLOOP AND WIN32 AND EXISTS "${SGLX_SDK_DIR}/SglxCppClient.cpp" AND EXISTS "${SGLX_SDK_DIR}/libSglxApi.a")
+    message(STATUS "Closed loop: SpikeGLX SDK in ${SGLX_SDK_DIR}")
+    add_library(fp_closedloop STATIC
+      src/closedloop/Calibration.cpp
+      src/closedloop/Config.cpp
+      src/closedloop/ConvolutionEngine.cpp
+      src/closedloop/DecisionThread.cpp
+      src/closedloop/FilterBank.cpp
+      src/closedloop/ImecFetchThread.cpp
+      src/closedloop/NiFetchThread.cpp
+      src/closedloop/SglxMetaReader.cpp
+      "${SGLX_SDK_DIR}/SglxCppClient.cpp")
+    target_include_directories(fp_closedloop PUBLIC src "${SGLX_SDK_DIR}")
+    # SglxApi.dll is the SDK's import library target; it must sit next to the exe at run time.
+    target_link_libraries(fp_closedloop PUBLIC "${SGLX_SDK_DIR}/libSglxApi.a")
+    target_sources(FeedbackPlease PRIVATE src/app/ClosedLoop.cpp src/app/ClosedLoopView.cpp)
+    target_link_libraries(FeedbackPlease PRIVATE fp_closedloop)
+    target_compile_definitions(FeedbackPlease PRIVATE FP_CLOSEDLOOP)
+    add_executable(fp_closedloop_test tests/test_closedloop.cpp src/app/ClosedLoop.cpp)
+    target_link_libraries(fp_closedloop_test PRIVATE fp_closedloop)
+    add_custom_command(TARGET fp_closedloop_test POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SGLX_SDK_DIR}/SglxApi.dll" "$<TARGET_FILE_DIR:fp_closedloop_test>")
+    add_test(NAME closedloop COMMAND fp_closedloop_test)
+    get_filename_component(_cl_script "${CLOSEDLOOP_FILTERGEN_DIR}/calibrate_for_closedloop.py" ABSOLUTE)
+    if(EXISTS "${_cl_script}")
+      target_compile_definitions(FeedbackPlease PRIVATE "FP_CLOSEDLOOP_DEFAULT_SCRIPT=\"${_cl_script}\"")
+    endif()
+    add_custom_command(TARGET FeedbackPlease POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SGLX_SDK_DIR}/SglxApi.dll" "$<TARGET_FILE_DIR:FeedbackPlease>")
+  elseif(FP_WITH_CLOSEDLOOP)
+    message(WARNING "Closed loop tab disabled: SpikeGLX SDK not found in ${SGLX_SDK_DIR}. Set SGLX_SDK_DIR.")
+  endif()
   if(WIN32)
     target_link_libraries(FeedbackPlease PRIVATE winmm comdlg32 dbghelp shell32 ole32)
   endif()

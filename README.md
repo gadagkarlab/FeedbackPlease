@@ -265,3 +265,53 @@ Please check these against the original VIs:
 - Hardware-timed DO/AO clocked from `ai/SampleClock` if you need sample-locked sync pulses
   (X-series supports this).
 - Record the AO and DO signals back on spare AI channels to measure true end-to-end latency.
+
+## Closed loop (spike-triggered feedback)
+
+The **Closed loop** tab is the former stand-alone `ClosedLoop.exe` (from `LiveSorter_BF`) inside this GUI. It
+runs on its own threads and SpikeGLX connections, so it can run at the same time as the microphone engine on
+the Live tab. Starting or stopping one does not affect the other. The engine writes each matched syllable's code
+to its **Syllable code port**; wire that port to the NI lines in **NI syllable lines** (default 5,6,7) that
+SpikeGLX records, and the closed loop sees those codes as syllable onsets.
+
+While the tab is selected the left panel shows ClosedLoop's config keys (same names and meaning as
+`config.example.txt`), grouped like the file. **Load config... / Export config...** read and write the
+`ClosedLoop.exe` config format, so existing files work unchanged. Settings are also saved with the others, next
+to the `.ini`, as `<name>.closedloop.txt`.
+
+- **Run calibration**: fits the filter and threshold from the training `.bin` + Kilosort folder (Python backend
+  runs `calibrate_for_closedloop.py`; its output goes to the log, **Stop** kills it). Results are written to the
+  filter folder; buttons open the diagnostic PNGs.
+- **Start live**: with *Calibrate before going live* on, calibrates first, then connects to SpikeGLX (it must be
+  acquiring), detects spikes on IMEC and syllable onsets on NI, counts spikes in the window after each onset and
+  raises `doLine` per the decision mode. Off: uses the saved filter.
+- **Test pulse**: raises `doLine` once, to check wiring.
+- Live view: counters, spike count per rendition against the threshold, spike times relative to onset with the
+  window and sub-windows marked, a table of recent decisions (with onset-to-pulse latency) and the log.
+
+Build: needs the SpikeGLX SDK (`SGLX_SDK_DIR`, default `../LiveSorter_BF/SDK/API`; `SglxApi.dll` is copied next to
+the exe). Without it the tab is left out. `CLOSEDLOOP_FILTERGEN_DIR` sets the default calibration script folder.
+The detector code lives in `src/closedloop/` (copied from `LiveSorter_BF/ClosedLoop`, with logging routed to the
+GUI and counters/decision callbacks added); `fp_closedloop_test.exe` checks the settings and runner without hardware.
+Open directly on the tab with `FeedbackPlease.exe bird.ini --closedloop`.
+
+## MSN finder
+
+The **MSN finder** tab looks through the units of a Kilosort run for ones that fire at a consistent time in a
+given syllable. It is based on the first figure cell of the `msnFinder` notebook, drawn live and never saved.
+
+1. Set **Run folder** to the CatGT output folder (e.g. `X:/Choc57_out/catgt_Choc57_d2.0_g0`; it holds the
+   `tcat.nidq` files, the sync edge files and `<run>_imec0/imec0_ks4`) and press **Load session**. The first load
+   of a run decodes the syllable labels from the NI file, which can take a minute; the result is cached (set
+   **Cache folder** to the notebook's `cache` folder to reuse what it already decoded).
+2. Pick a **Syllable** label. Units are ranked by the variance of their spike-time histogram (unwarped ms from
+   onset to the median syllable duration; *Histogram bins*, *Min spikes*, *Show lowest-variance units* as in the
+   notebook), lowest first.
+3. Page through the units with **prev / next**, the slider, the arrow keys or the ranking table. Each unit shows
+   the mean spectrogram, the syllable-aligned raster (median end and interquartile range in red; the gray band is
+   the *Window* centred on the unit's histogram peak), spikes in that window per rendition averaged over
+   *Rolling mean* renditions, the template waveform and the unit's position on its shank.
+
+The work is done by `tools/msn_finder/msn_server.py` (numpy + scipy, no pandas), which the app starts as a child
+process using the **Python** setting; `msn_data.py` next to it is the notebook's loader. Settings are saved next
+to the `.ini` as `<name>.msn.txt`. `FeedbackPlease.exe bird.ini --msn-load` opens the tab and loads the session.

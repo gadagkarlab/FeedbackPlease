@@ -1,7 +1,7 @@
 // FeedbackPlease: real-time song syllable detection and feedback (C++ port of
 // the LabVIEW DetectSyllables system).
 //
-//   FeedbackPlease.exe [settings.ini] [--autostart] [--tune <folder> [--analyze] [--summary]]
+//   FeedbackPlease.exe [settings.ini] [--autostart] [--tune <folder> [--analyze] [--summary]] [--closedloop] [--msn | --msn-load]
 
 #include <cstdio>
 #include <string>
@@ -30,6 +30,9 @@ int main(int argc, char** argv) {
     fp::installCrashHandler();
     std::string settings = "feedbackplease.ini", tuneFolder;
     bool autostart = false, analyze = false, summary = false;
+    bool closedLoop = false;
+    bool msn = false;
+    bool msnLoad = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--autostart")
@@ -40,6 +43,10 @@ int main(int argc, char** argv) {
             analyze = true;
         else if (a == "--summary")
             summary = true;
+        else if (a == "--closedloop")
+            closedLoop = true;
+        else if (a == "--msn" || a == "--msn-load")
+            msn = true, msnLoad = a == "--msn-load";
         else
             settings = a;
     }
@@ -82,6 +89,16 @@ int main(int argc, char** argv) {
         fp::Gui gui(settings);
         if (autostart) gui.startEngine();
         if (!tuneFolder.empty()) gui.openTune(tuneFolder, analyze, summary);
+#ifdef FP_CLOSEDLOOP
+        if (closedLoop) gui.openClosedLoop();
+#else
+        (void)closedLoop;
+#endif
+#ifdef FP_MSN
+        if (msn) gui.openMsn(msnLoad);
+#else
+        (void)msn;
+#endif
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
             // Minimized: vsync no longer throttles the loop, so it would spin a core

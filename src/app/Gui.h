@@ -5,6 +5,12 @@
 
 #include "app/Engine.h"
 #include "app/TuneView.h"
+#ifdef FP_CLOSEDLOOP
+#include "app/ClosedLoopView.h"
+#endif
+#ifdef FP_MSN
+#include "app/MsnFinderView.h"
+#endif
 #include "core/Params.h"
 
 namespace fp {
@@ -16,6 +22,15 @@ public:
     void draw();  // one ImGui frame
     void startEngine();
     void openTune(const std::string& folder, bool analyze, bool summary);
+#ifdef FP_CLOSEDLOOP
+    void openClosedLoop() { selectClTab_ = true; }
+#endif
+#ifdef FP_MSN
+    void openMsn(bool loadNow) {
+        selectMsnTab_ = true;
+        if (loadNow) msn_.loadSession();
+    }
+#endif
 
 private:
     void drawToolbar();
@@ -34,12 +49,23 @@ private:
     void drawEventLog();
 
     void pushParams();
+    std::string closedLoopPath() const;  // <settings file without .ini>.closedloop.txt
+    std::string msnPath() const;  // <settings file without .ini>.msn.txt
 
     AppParams p_;
     std::string settingsPath_;
     Engine engine_;
     EngineStats stats_;  // copied once per frame in draw()
     TuneView tune_;
+    int activeTab_ = 0;  // tab shown last frame: 0 Live, 1 Tune, 2 Closed loop, 3 MSN finder (picks the left panel)
+#ifdef FP_CLOSEDLOOP
+    ClosedLoopView closed_;  // spike-triggered closed loop; independent of engine_
+    bool selectClTab_ = false;
+#endif
+#ifdef FP_MSN
+    MsnFinderView msn_;  // unit finder for a Kilosort run; drives a Python helper
+    bool selectMsnTab_ = false;
+#endif
     std::string status_;
     bool selectTuneTab_ = false;
     int editSyl_ = 0;         // syllable being edited (shared with the Tune tab)
