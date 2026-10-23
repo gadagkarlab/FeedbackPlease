@@ -58,6 +58,8 @@ public:
 
     // Normalized correlation of a frame shape with a template (0 if sizes differ).
     static double correlate(const float* shape, int bands, const std::vector<float>& tmpl);
+    // The score used for detection: correlation, or the learned discriminant if enabled.
+    static double score(const float* shape, int bands, const SpectralTemplate& t);
     // Average of example shapes, normalized like a frame shape.
     static std::vector<float> average(const std::vector<std::vector<float>>& shapes);
 

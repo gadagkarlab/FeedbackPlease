@@ -588,10 +588,7 @@ void TuneView::setTemplateFromClick(AppParams& p, double tMs, bool add) {
     if (!add) t.examples.clear();
     t.examples.push_back({a->path, tMs});
     std::string err;
-    if (t.examples.size() == 1)
-        t.shape = shape;
-    else if (!rebuildTemplateShape(t, p, &err))
-        t.shape = shape;
+    if (!rebuildTemplateShape(t, p, &err)) t.shape = shape;  // also re-learns the discriminant
     char buf[200];
     std::snprintf(buf, sizeof buf, "%s: %s example at %.3f s (level %.1f dB), %zu example(s)", t.name.c_str(),
                   add ? "added" : "set to", tMs / 1000.0, level, t.examples.size());
@@ -997,7 +994,7 @@ void TuneView::drawFileView(AppParams& p) {
             if (*editTmpl_ >= 0 && *editTmpl_ < int(p.tmpl.list.size())) {
                 SpectralTemplate& t = p.tmpl.list[size_t(*editTmpl_)];
                 if (ImPlot::DragLineY(102, &t.thresh, templateColor(*editTmpl_), 1.5f)) {
-                    t.thresh = std::clamp(t.thresh, 0.0, 1.0);
+                    t.thresh = std::clamp(t.thresh, -1.0, 2.0);
                     changed() = true;
                 }
             }

@@ -945,7 +945,7 @@ void Gui::drawTemplates() {
         ImGui::SameLine();
         if (ImGui::SmallButton("x")) remove = i;
         InputD("threshold", &e.thresh, "%.3f", 4);
-        e.thresh = std::clamp(e.thresh, 0.0, 1.0);
+        e.thresh = std::clamp(e.thresh, -1.0, 2.0);
         ImGui::SameLine();
         if (InputI("frames", &e.minFrames, 3)) e.minFrames = std::clamp(e.minFrames, 1, 100);
         // Timing gate
@@ -975,12 +975,69 @@ void Gui::drawTemplates() {
         if (int(e.shape.size()) != bands) {
             ImGui::SameLine();
             ImGui::TextColored(kAmber, e.shape.empty() ? "empty: Ctrl+click in the Tune tab" : "spectrum settings changed");
-            if (!e.examples.empty()) {
+        }
+        if (!e.examples.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(e.stats ? "Re-learn" : "Learn from labeled files")) {
+                std::string err;
+                if (rebuildTemplateShape(e, P(), &err)) changed() = true;
+                else status_ = err;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Rebuilds the template from its examples and compares them with every other sound "
+                                  "in the files they come from.\nAll renditions of this syllable in those files "
+                                  "should be examples (Ctrl+Shift+click each one).");
+        }
+        if (Check("Discriminative", &e.discriminative) && e.stats) {
+            // The score scale changes: start from the suggested threshold.
+            e.thresh = e.discriminative ? e.stats->disc.suggested : e.stats->plain.suggested;
+        }
+        HelpMarker("Off: plain correlation with the averaged examples.\nOn: learned from the labeled files, so that "
+                   "only what makes this syllable different from every other sound in them counts: bands shared "
+                   "with other syllables, or that vary a lot in the rest of the song, get less weight. Examples "
+                   "score about 1 and other sounds about 0.\n\nAssumes every rendition of the syllable in the "
+                   "labeled files is an example. Frames around each example where the same sound continues are "
+                   "left out.");
+        if (e.discriminative && int(e.weights.size()) != bands) {
+            ImGui::SameLine();
+            ImGui::TextColored(kAmber, "not learned yet: plain correlation is used");
+        }
+        if (e.stats) {
+            const TemplateStats& st = *e.stats;
+            const TemplateSeparation& sep = e.discriminative && !st.disc.pos.empty() ? st.disc : st.plain;
+            ImGui::TextDisabled("%d file(s): %d target frames, %d other sounds", st.files, st.positives, st.negatives);
+            ImGui::TextDisabled("separation d': plain %.1f, discriminative %.1f", st.plain.dPrime, st.disc.dPrime);
+            if (!st.note.empty()) ImGui::TextColored(kAmber, "%s", st.note.c_str());
+            if (!sep.pos.empty() && !sep.neg.empty()) {
+                const bool gap = sep.maxNeg < sep.minPos;
+                ImGui::TextColored(gap ? kGreen : kAmber, gap ? "Separated: other sounds <= %.2f, examples >= %.2f"
+                                                              : "Overlap: other sounds up to %.2f, examples from %.2f",
+                                   sep.maxNeg, sep.minPos);
+                if (ImGui::SmallButton("Use suggested threshold")) {
+                    e.thresh = sep.suggested;
+                    changed() = true;
+                }
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Rebuild")) {
-                    std::string err;
-                    if (rebuildTemplateShape(e, P(), &err)) changed() = true;
-                    else status_ = err;
+                ImGui::TextDisabled("%.3f: %d other frame(s) above, %d example frame(s) below", sep.suggested,
+                                    sep.negAbove, sep.posBelow);
+                // Score histograms: examples vs everything else, with the threshold (drag it).
+                if (ImPlot::BeginPlot("##sep", ImVec2(-1, 9 * em()), ImPlotFlags_NoMenus | ImPlotFlags_NoBoxSelect)) {
+                    ImPlot::SetupAxes("score", "density", 0, ImPlotAxisFlags_AutoFit);
+                    double lo = std::min(sep.minPos, double(*std::min_element(sep.neg.begin(), sep.neg.end())));
+                    double hi = std::max(sep.maxNeg, double(*std::max_element(sep.pos.begin(), sep.pos.end())));
+                    lo = std::min(lo, e.thresh) - 0.05;
+                    hi = std::max(hi, e.thresh) + 0.05;
+                    ImPlot::SetupAxisLimits(ImAxis_X1, lo, hi, ImPlotCond_Always);
+                    ImPlot::SetupLegend(ImPlotLocation_NorthWest);
+                    const ImPlotRange range(lo, hi);
+                    ImPlot::SetNextFillStyle(kGrey, 0.6f);
+                    ImPlot::PlotHistogram("other sounds", sep.neg.data(), int(sep.neg.size()), 60, 1.0, range,
+                                          ImPlotHistogramFlags_Density);
+                    ImPlot::SetNextFillStyle(kGreen, 0.6f);
+                    ImPlot::PlotHistogram("examples", sep.pos.data(), int(sep.pos.size()), 60, 1.0, range,
+                                          ImPlotHistogramFlags_Density);
+                    if (ImPlot::DragLineX(0, &e.thresh, kAmber, 2.0f)) changed() = true;
+                    ImPlot::EndPlot();
                 }
             }
         }

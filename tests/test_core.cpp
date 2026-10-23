@@ -751,6 +751,82 @@ static void testSpectralTemplates() {
     CHECK(maxDiff < 1e-5);
 }
 
+static void testDiscriminativeTemplate() {
+    AppParams p;
+    p.tmpl.method = DetectMethod::Template;
+    p.tmpl.windowMs = 8.0;  // short window: plain correlation confuses syllables here
+    const double fs = p.hw.sampleRate;
+    const auto song = synthesizeSong(fs, 10.0, p.source.simNoiseVolts);
+    const std::string path = "fp_disc_test.wav";
+    {
+        WavWriter w;
+        w.open(path, fs);
+        w.write(song.data(), song.size());
+        w.close();
+    }
+    // Every rendition of syllable C labeled (motif every 1189 ms; C at +210 ms).
+    SpectralTemplate c;
+    c.name = "C";
+    for (int k = 0; k < 9; ++k) c.examples.push_back({path, 410.0 + 1189.0 * k});
+    std::string err;
+    CHECK(rebuildTemplateShape(c, p, &err));
+    CHECK(c.stats && int(c.weights.size()) == templateBands(p.tmpl));
+    if (!c.stats) return;
+    const auto& st = *c.stats;
+    std::printf("  %d target frames, %d other frames. plain: d' %.1f, max other %.2f vs min target %.2f. "
+                "discriminative: d' %.1f, max other %.2f vs min target %.2f\n",
+                st.positives, st.negatives, st.plain.dPrime, st.plain.maxNeg, st.plain.minPos, st.disc.dPrime,
+                st.disc.maxNeg, st.disc.minPos);
+    CHECK(st.disc.dPrime > st.plain.dPrime);
+    CHECK(st.disc.maxNeg < st.disc.minPos);  // fully separated
+
+    // Detection with each, at its suggested threshold: hits on C vs elsewhere.
+    auto run = [&](bool disc) {
+        AppParams q = p;
+        c.discriminative = disc;
+        c.thresh = disc ? st.disc.suggested : 0.85;
+        c.minFrames = 2;
+        q.tmpl.list = {c};
+        q.tmpl.target = 0;
+        const AppParams qr = paramsForRate(q, fs);
+        EnvelopeTrack env;
+        SongTrack sg;
+        FeatureTrack ft;
+        computeEnvelopeTrack(song, qr, env);
+        computeSongTrack(song, qr, sg);
+        computeFeatureTrack(song, qr, ft);
+        DecisionTrack dt;
+        runDecisions(env, sg, &ft, qr, dt);
+        int onC = 0, other = 0;
+        for (const auto& h : dt.tmplHits) {
+            const double k = std::round((h.ms - 410.0) / 1189.0);
+            (std::abs(h.ms - 410.0 - 1189.0 * k) < 20 ? onC : other)++;
+        }
+        std::printf("  %s: %d on C, %d elsewhere\n", disc ? "discriminative" : "plain (0.85)", onC, other);
+        return std::make_pair(onC, other);
+    };
+    const auto pl = run(false), di = run(true);
+    CHECK(di.first >= 9 && di.second == 0);
+    CHECK(di.second <= pl.second);
+
+    // Saved and loaded with the template.
+    std::ostringstream os;
+    AppParams q = p;
+    c.discriminative = true;
+    q.tmpl.list = {c};
+    writeParams(os, q);
+    {
+        std::ofstream f("fp_disc_test.ini");
+        f << os.str();
+    }
+    AppParams r;
+    CHECK(loadParams("fp_disc_test.ini", r));
+    CHECK(r.tmpl.list.size() == 1 && r.tmpl.list[0].discriminative && r.tmpl.list[0].weights.size() == c.weights.size() &&
+          std::abs(r.tmpl.list[0].bias - c.bias) < 1e-6);
+    std::remove("fp_disc_test.ini");
+    std::remove(path.c_str());
+}
+
 int main() {
     std::printf("BandEnvelope\n");
     testBandEnvelopeSine();
@@ -784,6 +860,8 @@ int main() {
     testParamsRoundTrip();
     std::printf("Spectral templates\n");
     testSpectralTemplates();
+    std::printf("Discriminative template\n");
+    testDiscriminativeTemplate();
     if (g_failures) {
         std::printf("%d check(s) FAILED\n", g_failures);
         return 1;

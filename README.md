@@ -191,6 +191,19 @@ what you tune is what runs once applied.
    - The detected template's code goes to the syllable code port, and the target template triggers
      feedback through the same feedback settings as before (delays, probabilities, song gate). The
      detection signal and its thresholds still drive the syllable TTL line and *Detect Signal Thresh*.
+   - **Discriminative** (per template): instead of plain correlation, a weighting learned from the labeled
+     files, the files the template's examples come from. **Every rendition of the syllable in those files
+     must be an example** (Ctrl+Shift+click each one). Every other sound in them above *min level* is
+     "other". Frames around each example where the same sound continues are left out. The weighting is a
+     regularized linear discriminant: bands shared with other syllables, or that vary a lot in the rest of
+     the song, count less. It is rescaled so examples score about 1 and other sounds about 0. It is
+     re-learned at every click and with **Re-learn**.
+   - Each template shows the result: d′ for plain and discriminative scoring, a histogram of example
+     scores vs other sounds with the threshold (drag it), and **Use suggested threshold**. The suggestion
+     is the middle of the gap if they separate; otherwise it is the best hit-rate minus false-alarm
+     trade-off. On the synthetic test song with an 8 ms window, plain correlation scored other syllables
+     up to 0.91 against 0.98 for the target (33 false detections). The discriminant scored them at most
+     0.28 against at least 0.93 (no false detections).
    - Changing window, band or frequency range rebuilds the templates from their examples, which re-reads
      the files they came from, so keep those recordings. Templates are saved in the settings file and
      copied by *Apply to box* with *Syllables / templates & target*.

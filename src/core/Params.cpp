@@ -13,6 +13,21 @@ namespace fp {
 
 namespace {
 
+// A list of numbers as one line of text (written by the saver, parsed back by the loader).
+template <class F>
+void floatList(F& f, const std::string& key, std::vector<float>& v) {
+    std::string s;
+    for (float x : v) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%s%.7g", s.empty() ? "" : " ", x);
+        s += buf;
+    }
+    f(key, s);
+    std::istringstream is(s);
+    v.clear();
+    for (float x; is >> x;) v.push_back(x);
+}
+
 // Calls f(key, field) for every persisted field. Shared by load and save so the
 // two can never drift apart.
 template <class F>
@@ -168,17 +183,10 @@ void visitParams(AppParams& p, F&& f) {
             f(ke + ".file", t.examples[j].file);
             f(ke + ".ms", t.examples[j].ms);
         }
-        // The shape as one line of numbers (written as text, parsed back on load).
-        std::string shape;
-        for (float v : t.shape) {
-            char buf[32];
-            std::snprintf(buf, sizeof buf, "%s%.6g", shape.empty() ? "" : " ", v);
-            shape += buf;
-        }
-        f(k + ".shape", shape);
-        std::istringstream is(shape);
-        t.shape.clear();
-        for (float v; is >> v;) t.shape.push_back(v);
+        floatList(f, k + ".shape", t.shape);
+        f(k + ".discriminative", t.discriminative);
+        floatList(f, k + ".weights", t.weights);
+        f(k + ".bias", t.bias);
     }
 
     f("display.window_sec", p.display.windowSec);

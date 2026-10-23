@@ -102,6 +102,11 @@ double TemplateMatcher::correlate(const float* shape, int bands, const std::vect
     return d;
 }
 
+double TemplateMatcher::score(const float* shape, int bands, const SpectralTemplate& t) {
+    if (t.discriminative && int(t.weights.size()) == bands) return correlate(shape, bands, t.weights) + t.bias;
+    return correlate(shape, bands, t.shape);
+}
+
 std::vector<float> TemplateMatcher::average(const std::vector<std::vector<float>>& shapes) {
     std::vector<float> out;
     for (const auto& s : shapes) {
@@ -129,7 +134,7 @@ TemplateResult TemplateMatcher::update(const float* shape, int bands, double lev
     const bool loud = shape && levelDb >= tp.minLevelDb;
     for (size_t i = 0; i < n; ++i) {
         const SpectralTemplate& t = tp.list[i];
-        const double s = loud ? correlate(shape, bands, t.shape) : 0.0;
+        const double s = loud ? score(shape, bands, t) : 0.0;
         scores_[i] = float(s);
         run_[i] = (t.enabled && loud && s >= t.thresh) ? run_[i] + 1 : 0;
         // Detected once per stretch above threshold, when it has lasted minFrames.

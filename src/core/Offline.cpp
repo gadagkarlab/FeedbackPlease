@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <thread>
 
 #ifdef _WIN32
@@ -125,24 +126,193 @@ bool templateShapeAt(const std::vector<float>& x, const AppParams& pr, double tM
     return true;
 }
 
-bool rebuildTemplateShape(SpectralTemplate& t, const AppParams& p, std::string* err) {
-    std::vector<std::vector<float>> shapes;
-    std::string path;
-    WavData w;
-    for (const auto& ex : t.examples) {
-        if (ex.file != path) {
-            path = ex.file;
-            if (!readWav(path, w, err)) w.samples.clear();
+namespace {
+
+// Solves A x = b for symmetric positive definite A (n x n, row-major) by Cholesky.
+bool solveSpd(std::vector<double> A, std::vector<double> b, int n, std::vector<double>& x) {
+    for (int j = 0; j < n; ++j) {
+        double d = A[size_t(j) * n + j];
+        for (int k = 0; k < j; ++k) d -= A[size_t(j) * n + k] * A[size_t(j) * n + k];
+        if (d <= 1e-15) return false;
+        d = std::sqrt(d);
+        A[size_t(j) * n + j] = d;
+        for (int i = j + 1; i < n; ++i) {
+            double s = A[size_t(i) * n + j];
+            for (int k = 0; k < j; ++k) s -= A[size_t(i) * n + k] * A[size_t(j) * n + k];
+            A[size_t(i) * n + j] = s / d;
         }
-        std::vector<float> s;
-        if (!w.samples.empty() && templateShapeAt(w.samples, paramsForRate(p, w.sampleRate), ex.ms, s))
-            shapes.push_back(std::move(s));
+    }
+    for (int i = 0; i < n; ++i) {  // L y = b
+        double s = b[size_t(i)];
+        for (int k = 0; k < i; ++k) s -= A[size_t(i) * n + k] * b[size_t(k)];
+        b[size_t(i)] = s / A[size_t(i) * n + i];
+    }
+    for (int i = n - 1; i >= 0; --i) {  // L^T x = y
+        double s = b[size_t(i)];
+        for (int k = i + 1; k < n; ++k) s -= A[size_t(k) * n + i] * b[size_t(k)];
+        b[size_t(i)] = s / A[size_t(i) * n + i];
+    }
+    x = std::move(b);
+    return true;
+}
+
+TemplateSeparation separation(std::vector<float> pos, std::vector<float> neg) {
+    TemplateSeparation s;
+    s.pos = std::move(pos);
+    s.neg = std::move(neg);
+    if (s.pos.empty() || s.neg.empty()) return s;
+    auto meanVar = [](const std::vector<float>& v, double& m, double& var) {
+        m = 0;
+        for (float x : v) m += x;
+        m /= double(v.size());
+        var = 0;
+        for (float x : v) var += (x - m) * (x - m);
+        var /= double(std::max<size_t>(1, v.size() - 1));
+    };
+    double mp, vp, mn, vn;
+    meanVar(s.pos, mp, vp);
+    meanVar(s.neg, mn, vn);
+    s.dPrime = (mp - mn) / std::sqrt(std::max(1e-12, 0.5 * (vp + vn)));
+    s.minPos = *std::min_element(s.pos.begin(), s.pos.end());
+    s.maxNeg = *std::max_element(s.neg.begin(), s.neg.end());
+    if (s.maxNeg < s.minPos) {
+        s.suggested = 0.5 * (s.maxNeg + s.minPos);  // they separate: middle of the gap
+    } else {
+        // They overlap: the threshold with the best hit rate minus false-alarm rate.
+        std::vector<float> p = s.pos, n = s.neg;
+        std::sort(p.begin(), p.end());
+        std::sort(n.begin(), n.end());
+        double best = -2;
+        for (float th : p) {
+            const double hit = double(p.end() - std::lower_bound(p.begin(), p.end(), th)) / double(p.size());
+            const double fa = double(n.end() - std::lower_bound(n.begin(), n.end(), th)) / double(n.size());
+            if (hit - fa > best) best = hit - fa, s.suggested = th;
+        }
+    }
+    for (float x : s.neg) s.negAbove += x >= s.suggested;
+    for (float x : s.pos) s.posBelow += x < s.suggested;
+    return s;
+}
+
+}  // namespace
+
+bool rebuildTemplateShape(SpectralTemplate& t, const AppParams& p, std::string* err) {
+    // Positives: the frames at each example (+-2 ms). Excluded: frames whose window overlaps
+    // an example's. Negatives: every other frame above the min level in the labeled files.
+    AppParams pt = p;
+    pt.tmpl.method = DetectMethod::Template;
+    const int bands = templateBands(pt.tmpl);
+    std::vector<std::vector<float>> shapes;  // the exact example frames (the plain template)
+    std::vector<const float*> posF, negF;
+    std::vector<std::unique_ptr<FeatureTrack>> tracks;  // keep the frames alive
+    auto stats = std::make_shared<TemplateStats>();
+
+    std::vector<std::string> files;
+    for (const auto& ex : t.examples)
+        if (std::find(files.begin(), files.end(), ex.file) == files.end()) files.push_back(ex.file);
+    for (const auto& file : files) {
+        WavData w;
+        if (!readWav(file, w, err)) continue;
+        const AppParams pr = paramsForRate(pt, w.sampleRate);
+        auto ft = std::make_unique<FeatureTrack>();
+        computeFeatureTrack(w.samples, pr, *ft);
+        if (ft->bands != bands || ft->frames() == 0) continue;
+        const double frameMs = pr.hw.samplesPerFrame * 1000.0 / pr.hw.sampleRate;
+        const long posR = std::lround(2.0 / frameMs), exclR = std::max(posR, long(std::ceil(pt.tmpl.windowMs / frameMs)));
+        std::vector<int8_t> role(ft->frames(), 0);  // 0 negative, 1 positive, -1 excluded
+        for (const auto& ex : t.examples) {
+            if (ex.file != file) continue;
+            const long k0 = std::lround(ex.ms / frameMs) - 1;
+            if (k0 >= 0 && size_t(k0) < ft->frames() && ft->at(size_t(k0)))
+                shapes.emplace_back(ft->at(size_t(k0)), ft->at(size_t(k0)) + bands);
+            for (long k = k0 - exclR; k <= k0 + exclR; ++k)
+                if (k >= 0 && size_t(k) < role.size() && role[size_t(k)] != 1)
+                    role[size_t(k)] = std::abs(k - k0) <= posR ? 1 : -1;
+            // The same sound continuing on either side of the example is neither target nor
+            // "other": training against it would fight the template itself.
+            const float* f0 = k0 >= 0 && size_t(k0) < ft->frames() ? ft->at(size_t(k0)) : nullptr;
+            const long maxR = std::lround(150.0 / frameMs);
+            for (int dir : {-1, 1}) {
+                if (!f0) break;
+                for (long k = k0 + dir * (exclR + 1); std::abs(k - k0) <= maxR && k >= 0 && size_t(k) < role.size();
+                     k += dir) {
+                    const float* f = ft->at(size_t(k));
+                    if (!f || TemplateMatcher::correlate(f, bands, std::vector<float>(f0, f0 + bands)) < 0.8) break;
+                    if (role[size_t(k)] != 1) role[size_t(k)] = -1;
+                }
+            }
+        }
+        for (size_t k = 0; k < role.size(); ++k) {
+            const float* f = ft->at(k);
+            if (!f) continue;
+            if (role[k] == 1) posF.push_back(f);
+            else if (role[k] == 0 && ft->levelDb[k] >= pt.tmpl.minLevelDb) negF.push_back(f);
+        }
+        ++stats->files;
+        tracks.push_back(std::move(ft));
     }
     if (shapes.empty()) {
         if (err && err->empty()) *err = t.name + ": no usable examples";
         return false;
     }
     t.shape = TemplateMatcher::average(shapes);
+    stats->positives = int(posF.size());
+    stats->negatives = int(negF.size());
+
+    auto scoreAll = [&](const std::vector<const float*>& fr, auto&& fn) {
+        std::vector<float> s(fr.size());
+        for (size_t i = 0; i < fr.size(); ++i) s[i] = float(fn(fr[i]));
+        return s;
+    };
+    auto plain = [&](const float* f) { return TemplateMatcher::correlate(f, bands, t.shape); };
+    stats->plain = separation(scoreAll(posF, plain), scoreAll(negF, plain));
+
+    // Discriminant: w = (S + shrinkage)^-1 (mean pos - mean neg), S = covariance of the other
+    // sounds. Bands that vary a lot in the rest of the song (or move together) count less.
+    t.weights.clear();
+    t.bias = 0.0;
+    if (int(negF.size()) < 2 * bands) {
+        stats->note = "not enough other sound in the labeled files to learn from";
+    } else {
+        const int n = bands;
+        std::vector<double> mp(size_t(n), 0.0), mn(size_t(n), 0.0), S(size_t(n) * n, 0.0);
+        for (const float* f : posF)
+            for (int i = 0; i < n; ++i) mp[size_t(i)] += f[i] / double(posF.size());
+        for (const float* f : negF)
+            for (int i = 0; i < n; ++i) mn[size_t(i)] += f[i] / double(negF.size());
+        std::vector<double> d(static_cast<size_t>(n));
+        for (const float* f : negF) {
+            for (int i = 0; i < n; ++i) d[size_t(i)] = f[i] - mn[size_t(i)];
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j <= i; ++j) S[size_t(i) * n + j] += d[size_t(i)] * d[size_t(j)];
+        }
+        double tr = 0.0;
+        for (int i = 0; i < n; ++i) tr += S[size_t(i) * n + i];
+        const double lambda = 0.1, ridge = lambda * tr / n / double(negF.size() - 1);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j <= i; ++j) {
+                double v = (1.0 - lambda) * S[size_t(i) * n + j] / double(negF.size() - 1);
+                if (i == j) v += ridge;
+                S[size_t(i) * n + j] = S[size_t(j) * n + i] = v;
+            }
+        std::vector<double> diff(static_cast<size_t>(n)), w;
+        for (int i = 0; i < n; ++i) diff[size_t(i)] = mp[size_t(i)] - mn[size_t(i)];
+        double a = 0, c = 0;
+        if (solveSpd(S, diff, n, w)) {
+            for (int i = 0; i < n; ++i) a += w[size_t(i)] * mp[size_t(i)], c += w[size_t(i)] * mn[size_t(i)];
+        }
+        if (a - c > 1e-12) {
+            // Rescaled so the examples average 1 and the other sounds 0.
+            t.weights.resize(size_t(n));
+            for (int i = 0; i < n; ++i) t.weights[size_t(i)] = float(w[size_t(i)] / (a - c));
+            t.bias = -c / (a - c);
+            auto disc = [&](const float* f) { return TemplateMatcher::correlate(f, bands, t.weights) + t.bias; };
+            stats->disc = separation(scoreAll(posF, disc), scoreAll(negF, disc));
+        } else {
+            stats->note = "could not learn a discriminant (examples look like the rest)";
+        }
+    }
+    t.stats = stats;
     return true;
 }
 
@@ -256,6 +426,8 @@ uint64_t decisionKey(const AppParams& p) {
         h << s.enabled << s.code << s.thresh << s.minFrames << s.gateIndex << s.gateMinMs << s.gateMaxMs
           << int(s.shape.size());
         if (!s.shape.empty()) h.bytes(s.shape.data(), s.shape.size() * sizeof(float));
+        h << s.discriminative << s.bias << int(s.weights.size());
+        if (!s.weights.empty()) h.bytes(s.weights.data(), s.weights.size() * sizeof(float));
     }
     h << p.spectrum.sylStartThresh << p.spectrum.sylEndThresh << p.spectrum.minGapMs;
     h << p.codes.target;

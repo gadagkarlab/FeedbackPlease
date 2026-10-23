@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -216,11 +217,26 @@ struct TemplateExample {
     double ms = 0.0;   // end of the analysis window in that file
 };
 
+// How well a template separates its labeled examples from everything else in the files
+// they come from (computed when the template is rebuilt; not saved).
+struct TemplateSeparation {
+    std::vector<float> pos, neg;  // scores of example frames / of all other loud frames
+    double dPrime = 0.0;          // (mean pos - mean neg) / pooled SD
+    double suggested = 0.0;       // threshold: midway in the gap if they separate, else best balance
+    double minPos = 0.0, maxNeg = 0.0;
+    int negAbove = 0, posBelow = 0;  // at the suggested threshold
+};
+struct TemplateStats {
+    int files = 0, positives = 0, negatives = 0;
+    TemplateSeparation plain, disc;
+    std::string note;  // why discriminative training failed, if it did
+};
+
 struct SpectralTemplate {
     std::string name = "template";
     int code = 1;  // value written to the syllable code port
     bool enabled = true;
-    double thresh = 0.9;   // correlation needed, -1..1
+    double thresh = 0.9;   // score needed (correlation, or ~0..1 when discriminative)
     int minFrames = 3;     // consecutive frames at or above thresh
     // Optional timing gate: only counts if template gateIndex was detected between
     // gateMinMs and gateMaxMs earlier. -1 = no gate.
@@ -228,6 +244,13 @@ struct SpectralTemplate {
     double gateMinMs = 50.0, gateMaxMs = 150.0;
     std::vector<TemplateExample> examples;  // averaged into shape
     std::vector<float> shape;               // normalized band log-powers (see above)
+    // Discriminative: score = weights . features + bias, learned from the labeled files (all
+    // renditions of this syllable in them must be examples) so that the examples score ~1
+    // and every other sound in those files ~0. Off = plain correlation with shape.
+    bool discriminative = false;
+    std::vector<float> weights;
+    double bias = 0.0;
+    std::shared_ptr<const TemplateStats> stats;  // not saved
 };
 
 struct TemplateParams {
