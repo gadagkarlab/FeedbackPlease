@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "core/Params.h"
@@ -47,11 +48,28 @@ struct SyllableInfo {
     int code = 0;             // its U8 code
 };
 
+// Template features per frame (template method): bands values per frame + level.
+struct FeatureTrack {
+    int bands = 0;
+    std::vector<float> shape;    // frames x bands
+    std::vector<float> levelDb;  // per frame; -1e9 before the first full window
+    size_t frames() const { return levelDb.size(); }
+    const float* at(size_t k) const { return bands > 0 && levelDb[k] > -1e8f ? &shape[k * size_t(bands)] : nullptr; }
+};
+
+struct TemplateHitInfo {
+    double ms = 0.0;
+    int index = -1;
+    bool gated = true;
+};
+
 struct DecisionTrack {
     std::vector<uint8_t> inSyllable;  // per frame
     std::vector<SyllableInfo> syllables;
     std::vector<double> matchMs, blockedMs, suppressedMs, catchMs;
     std::vector<double> fire1Ms, fire2Ms;
+    std::vector<std::vector<float>> tmplScores;  // template method: per template, per frame
+    std::vector<TemplateHitInfo> tmplHits;
 };
 
 // pr must already be rate-adjusted (paramsForRate). Returns false if cancelled.
@@ -60,12 +78,22 @@ bool computeEnvelopeTrack(const std::vector<float>& x, const AppParams& pr, Enve
                           const std::atomic<bool>* cancel = nullptr, std::atomic<float>* progress = nullptr,
                           int threads = 0);
 void computeSongTrack(const std::vector<float>& x, const AppParams& pr, SongTrack& out);
-void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const AppParams& pr, DecisionTrack& out,
+// Template features of every frame (empty unless the template method is selected).
+void computeFeatureTrack(const std::vector<float>& x, const AppParams& pr, FeatureTrack& out);
+// The template features of the window ending at tMs (for building templates from clicks).
+bool templateShapeAt(const std::vector<float>& x, const AppParams& pr, double tMs, std::vector<float>& shape,
+                     double* levelDb = nullptr);
+// Recomputes t.shape from its examples (each file is read from disk). p: the tuning set
+// (not rate-adjusted). Examples that cannot be read are skipped; false if none could.
+bool rebuildTemplateShape(SpectralTemplate& t, const AppParams& p, std::string* err = nullptr);
+void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const FeatureTrack* feat, const AppParams& pr,
+                  DecisionTrack& out,
                   uint32_t seed = 12345);
 
 // Fingerprints of the settings each stage depends on, to know what to recompute.
 uint64_t envelopeKey(const AppParams& pr);
 uint64_t songKey(const AppParams& pr);
+uint64_t featureKey(const AppParams& pr);
 uint64_t decisionKey(const AppParams& pr);
 
 }  // namespace fp

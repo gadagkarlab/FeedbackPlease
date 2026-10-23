@@ -37,7 +37,8 @@ struct FileAnalysis {
     std::shared_ptr<const Spectrogram> spec;
     std::shared_ptr<const EnvelopeTrack> env;
     std::shared_ptr<const SongTrack> song;
-    uint64_t specKey = 0, envKey = 0, songKey = 0;
+    std::shared_ptr<const FeatureTrack> feat;  // template method only
+    uint64_t specKey = 0, envKey = 0, songKey = 0, featKey = 0;
 };
 
 // Analyzes the file being viewed on a background thread. A new request cancels
@@ -75,6 +76,7 @@ struct BatchEntry {
     double durationSec = 0.0;
     std::shared_ptr<const EnvelopeTrack> env;
     std::shared_ptr<const SongTrack> song;
+    std::shared_ptr<const FeatureTrack> feat;  // template method only
     std::string error;
 };
 
@@ -111,7 +113,7 @@ public:
     ~TuneView();
     // Draws the tab. Edits to p set ui::changed(). editSyllable is the syllable being
     // edited (index into p.codes.list), shared with the parameter panel.
-    void draw(AppParams& p, int& editSyllable);
+    void draw(AppParams& p, int& editSyllable, int& editTemplate);
     const std::string& folder() const { return folder_; }
     // Opens a folder (and optionally starts the whole-folder analysis), e.g. from the command line.
     void openFolder(const std::string& folder, bool analyze, const AppParams& p, bool showSummary = false);
@@ -141,7 +143,7 @@ private:
     // Current file
     FileAnalyzer analyzer_;
     std::string reqPath_;
-    uint64_t reqEnvKey_ = 0, reqSongKey_ = 0, reqSpecKey_ = 0;
+    uint64_t reqEnvKey_ = 0, reqSongKey_ = 0, reqSpecKey_ = 0, reqFeatKey_ = 0;
     double lastRequestTime_ = -1.0;
     std::shared_ptr<const FileAnalysis> shown_;
     DecisionTrack dec_;
@@ -150,6 +152,7 @@ private:
     // result can never be mistaken for a new one allocated at the same address.
     std::shared_ptr<const EnvelopeTrack> decEnv_;
     std::shared_ptr<const SongTrack> decSong_;
+    std::shared_ptr<const FeatureTrack> decFeat_;
 
     // Display
     int specWindow_ = 512;
@@ -166,6 +169,10 @@ private:
     bool openFileTab_ = false, openSummaryTab_ = false;
     int dummyEdit_ = 0;
     int* edit_ = &dummyEdit_;  // the GUI's "syllable being edited", valid during draw()
+    int dummyEditTmpl_ = -1;
+    int* editTmpl_ = &dummyEditTmpl_;  // the template being edited, valid during draw()
+    void setTemplateFromClick(AppParams& p, double tMs, bool add);
+    uint64_t rebuiltFeatKey_ = 0;
     std::string status_;
 
     // Folder analysis

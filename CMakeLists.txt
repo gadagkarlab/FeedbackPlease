@@ -33,7 +33,8 @@ add_library(fp_core STATIC
   src/core/SongDetector.cpp
   src/core/SongRecorder.cpp
   src/core/SyllableCodes.cpp
-  src/core/SynthSong.cpp)
+  src/core/SynthSong.cpp
+  src/core/SpectralTemplate.cpp)
 target_include_directories(fp_core PUBLIC src)
 
 # ---- I/O backends + real-time engine

@@ -13,6 +13,7 @@
 #include "core/BandEnvelope.h"
 #include "core/Detector.h"
 #include "core/SongDetector.h"
+#include "core/WavFile.h"
 
 namespace fp {
 
@@ -89,10 +90,69 @@ void computeSongTrack(const std::vector<float>& x, const AppParams& pr, SongTrac
     }
 }
 
-void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const AppParams& pr, DecisionTrack& out,
-                  uint32_t seed) {
+void computeFeatureTrack(const std::vector<float>& x, const AppParams& pr, FeatureTrack& out) {
+    out = FeatureTrack{};
+    if (pr.tmpl.method != DetectMethod::Template) return;
+    const int n = pr.hw.samplesPerFrame;
+    const size_t frames = x.size() / size_t(n);
+    TemplateFeatures tf;
+    tf.configure(pr.hw.sampleRate, pr.tmpl, pr.proc.meanSubtract);
+    const int N = tf.windowSamples();
+    out.bands = tf.bands();
+    out.shape.assign(frames * size_t(out.bands), 0.0f);
+    out.levelDb.assign(frames, -1e9f);  // = not ready
+    if (out.bands == 0) return;
+    // Same windows as the live detector: the N samples ending at each frame's end.
+    for (size_t k = 0; k < frames; ++k) {
+        const size_t end = (k + 1) * size_t(n);
+        if (end >= size_t(N)) out.levelDb[k] = float(tf.compute(&x[end - N], &out.shape[k * size_t(out.bands)]));
+    }
+}
+
+bool templateShapeAt(const std::vector<float>& x, const AppParams& pr, double tMs, std::vector<float>& shape,
+                     double* levelDb) {
+    const int n = pr.hw.samplesPerFrame;
+    TemplateFeatures tf;
+    tf.configure(pr.hw.sampleRate, pr.tmpl, pr.proc.meanSubtract);
+    const int N = tf.windowSamples();
+    // The frame whose end is closest to tMs, as the live detector would see it.
+    const long k = std::lround(tMs * pr.hw.sampleRate / 1000.0 / n) - 1;
+    const size_t end = size_t(std::max(0L, k) + 1) * size_t(n);
+    if (k < 0 || end > x.size() || end < size_t(N) || tf.bands() == 0) return false;
+    shape.assign(size_t(tf.bands()), 0.0f);
+    const double lv = tf.compute(&x[end - N], shape.data());
+    if (levelDb) *levelDb = lv;
+    return true;
+}
+
+bool rebuildTemplateShape(SpectralTemplate& t, const AppParams& p, std::string* err) {
+    std::vector<std::vector<float>> shapes;
+    std::string path;
+    WavData w;
+    for (const auto& ex : t.examples) {
+        if (ex.file != path) {
+            path = ex.file;
+            if (!readWav(path, w, err)) w.samples.clear();
+        }
+        std::vector<float> s;
+        if (!w.samples.empty() && templateShapeAt(w.samples, paramsForRate(p, w.sampleRate), ex.ms, s))
+            shapes.push_back(std::move(s));
+    }
+    if (shapes.empty()) {
+        if (err && err->empty()) *err = t.name + ": no usable examples";
+        return false;
+    }
+    t.shape = TemplateMatcher::average(shapes);
+    return true;
+}
+
+void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const FeatureTrack* feat, const AppParams& pr,
+                  DecisionTrack& out, uint32_t seed) {
     out = DecisionTrack{};
     const size_t frames = std::min(env.value.size(), song.active.size());
+    const bool useTmpl = pr.tmpl.method == DetectMethod::Template;
+    const bool haveFeat = useTmpl && feat && feat->frames() >= frames;
+    if (useTmpl) out.tmplScores.assign(pr.tmpl.list.size(), std::vector<float>(frames, 0.0f));
     out.inSyllable.resize(frames);
     Detector det(seed);
     det.setParams(pr);
@@ -103,7 +163,13 @@ void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const AppPara
         st.fraction = song.fraction[k];
         st.active = song.active[k] != 0;
         st.detected = st.active;
-        const FrameResult r = det.decide(uint64_t(k + 1) * uint64_t(env.frameSamples), env.value[k], st, dtMs);
+        const FrameResult r = det.decide(uint64_t(k + 1) * uint64_t(env.frameSamples), env.value[k], st, dtMs,
+                                         haveFeat ? feat->at(k) : nullptr, haveFeat ? feat->levelDb[k] : -200.0);
+        if (useTmpl) {
+            const auto& sc = det.templateMatcher().scores();
+            for (size_t i = 0; i < sc.size() && i < out.tmplScores.size(); ++i) out.tmplScores[i][k] = sc[i];
+            for (const auto& h : det.templateMatcher().hits()) out.tmplHits.push_back({r.tMs, h.index, h.gated});
+        }
         out.inSyllable[k] = r.seg.inSyllable ? 1 : 0;
         if (r.seg.offset) {
             // The gap turned out real (>= min gap): the frames since the drop were not syllable.
@@ -174,8 +240,23 @@ uint64_t songKey(const AppParams& p) {
     return h.h;
 }
 
+uint64_t featureKey(const AppParams& p) {
+    const auto& t = p.tmpl;
+    Hasher h;
+    h << p.hw.sampleRate << p.hw.samplesPerFrame << int(t.method) << t.windowMs << t.lowHz << t.highHz << t.bandHz
+      << p.proc.meanSubtract;
+    return h.h;
+}
+
 uint64_t decisionKey(const AppParams& p) {
     Hasher h;
+    const auto& t = p.tmpl;
+    h << int(t.method) << t.minLevelDb << t.rearmMs << t.target << int(t.list.size());
+    for (const auto& s : t.list) {
+        h << s.enabled << s.code << s.thresh << s.minFrames << s.gateIndex << s.gateMinMs << s.gateMaxMs
+          << int(s.shape.size());
+        if (!s.shape.empty()) h.bytes(s.shape.data(), s.shape.size() * sizeof(float));
+    }
     h << p.spectrum.sylStartThresh << p.spectrum.sylEndThresh << p.spectrum.minGapMs;
     h << p.codes.target;
     const auto& f = p.fb;

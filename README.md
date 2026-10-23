@@ -168,6 +168,32 @@ what you tune is what runs once applied.
      folder, the number of files and their size.
    - The move is disabled while the analysis is running, if the song settings changed since it ran
      (re-analyze first), or if the song detector is off.
+5. **Spectral templates** (*Detection method → Spectral templates*, under Syllables & Target). This is an
+   alternative to IOI / SD sequences that needs no onset / offset thresholds, similar to EvTAF (Tumer &
+   Brainard 2007). Every frame, the last *window* ms of audio (default 12) is reduced to log power in bands
+   (default 125 Hz from 500 Hz to 10 kHz). It is normalized, so only the spectral shape counts, not
+   loudness, and then correlated with each template (1 = identical shape).
+   - **Make a template**: in the File view, **Ctrl+click** on the spectrogram or detection plot just after
+     a distinctive part of the syllable. The template is the window ending at the cursor. With no template
+     selected, this creates one and makes it the feedback target. **Ctrl+Shift+click** adds more examples
+     to the edited template, from this or other files. They are averaged, so a few renditions make it more
+     robust. **+ New template** makes the next Ctrl+click create another one.
+   - The detection plot shows each template's correlation on the right axis (0–1), with the edited one
+     bold and its **threshold** as a draggable line. Dots mark detections, filled when they count and
+     hollow when they failed a timing gate. Hover the plot to read every template's score and the level.
+   - A template is detected when its correlation stays at or above its **threshold** (default 0.9) for
+     **frames** frames in a row (default 3) while the level is above **min level**. It is detected again
+     only after dropping below the threshold and at least **re-arm** ms later. Detection lands a few ms
+     after the point you clicked, at a consistent point in the syllable.
+   - **Timing gate**: *after T1, 150 to 230 ms earlier* makes a template count only if T1 was detected in
+     that window. Use it to tell apart syllables that look alike, or to target a syllable in one position
+     of the motif.
+   - The detected template's code goes to the syllable code port, and the target template triggers
+     feedback through the same feedback settings as before (delays, probabilities, song gate). The
+     detection signal and its thresholds still drive the syllable TTL line and *Detect Signal Thresh*.
+   - Changing window, band or frequency range rebuilds the templates from their examples, which re-reads
+     the files they came from, so keep those recordings. Templates are saved in the settings file and
+     copied by *Apply to box* with *Syllables / templates & target*.
 
 The offline analysis uses the same code as the real-time detector and is tested to produce bit-identical
 results, including the random feedback draws for a given seed.

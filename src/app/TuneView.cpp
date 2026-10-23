@@ -36,7 +36,15 @@ constexpr double kPi = 3.14159265358979323846;
 const ImVec4 kCyan(0.35f, 0.85f, 0.95f, 1.0f);
 const ImVec4 kYellow(0.95f, 0.90f, 0.35f, 1.0f);
 
+ImVec4 templateColor(int i) {
+    static const ImVec4 c[] = {{1.00f, 0.55f, 0.20f, 1}, {0.35f, 0.85f, 0.95f, 1}, {0.95f, 0.45f, 0.75f, 1},
+                               {0.70f, 0.95f, 0.40f, 1}, {0.95f, 0.90f, 0.35f, 1}, {0.65f, 0.55f, 1.00f, 1}};
+    return c[size_t(std::max(0, i)) % (sizeof c / sizeof c[0])];
+}
+
 uint64_t specKeyOf(int window, double maxHz) { return (uint64_t(window) << 32) ^ uint64_t(maxHz * 16.0); }
+// What the slow per-file tracks (detection signal, template features) depend on.
+uint64_t tracksKey(const AppParams& p) { return envelopeKey(p) ^ (featureKey(p) * 0x9E3779B97F4A7C15ull); }
 
 Spectrogram computeSpectrogram(const std::vector<float>& x, double fsr, int W, double fMax,
                                const std::atomic<bool>& cancel) {
@@ -224,6 +232,14 @@ void FileAnalyzer::run() {
             a->songKey = songK;
             publish(a);
         }
+        const uint64_t featK = featureKey(job.p);
+        if (a->featKey != featK || (!a->feat && job.p.tmpl.method == DetectMethod::Template)) {
+            auto t = std::make_shared<FeatureTrack>();
+            computeFeatureTrack(*a->audio, pr, *t);
+            a->feat = t;
+            a->featKey = featK;
+            publish(a);
+        }
         const uint64_t envK = envelopeKey(job.p);
         if (!a->env || a->envKey != envK) {
             auto e = std::make_shared<EnvelopeTrack>();
@@ -267,7 +283,7 @@ void BatchAnalyzer::start(const std::vector<std::string>& files, const AppParams
     {
         std::lock_guard<std::mutex> lk(mx_);
         entries_.clear();
-        envKey_ = envelopeKey(p);
+        envKey_ = tracksKey(p);
         songKey_ = songKey(p);
         ++version_;
     }
@@ -297,6 +313,9 @@ void BatchAnalyzer::run(std::vector<std::string> files, AppParams p) {
         if (!computeEnvelopeTrack(w.samples, pr, *env, &cancel_, &fileProgress_)) break;
         auto song = std::make_shared<SongTrack>();
         computeSongTrack(w.samples, pr, *song);
+        auto feat = std::make_shared<FeatureTrack>();
+        computeFeatureTrack(w.samples, pr, *feat);
+        e.feat = feat;
         e.env = env;
         e.song = song;
         {
@@ -395,9 +414,9 @@ void TuneView::select(int index) {
 void TuneView::updateRequests(const AppParams& p) {
     if (selected_ < 0 || selected_ >= int(files_.size())) return;
     const std::string& path = files_[selected_];
-    const uint64_t ek = envelopeKey(p), sk = songKey(p), xk = specKeyOf(specWindow_, specMaxHz_);
+    const uint64_t ek = envelopeKey(p), sk = songKey(p), xk = specKeyOf(specWindow_, specMaxHz_), fk = featureKey(p);
     const bool newFile = path != reqPath_;
-    const bool changedKeys = ek != reqEnvKey_ || sk != reqSongKey_ || xk != reqSpecKey_;
+    const bool changedKeys = ek != reqEnvKey_ || sk != reqSongKey_ || xk != reqSpecKey_ || fk != reqFeatKey_;
     const double now = ImGui::GetTime();
     // While someone drags a band edge, restart the analysis at most ~8 times a second.
     if (newFile || (changedKeys && now - lastRequestTime_ > 0.12)) {
@@ -406,6 +425,7 @@ void TuneView::updateRequests(const AppParams& p) {
         reqEnvKey_ = ek;
         reqSongKey_ = sk;
         reqSpecKey_ = xk;
+        reqFeatKey_ = fk;
         lastRequestTime_ = now;
     }
 }
@@ -418,11 +438,12 @@ void TuneView::updateDecisions(const AppParams& p, const FileAnalysis& a) {
         return;
     }
     const uint64_t k = decisionKey(p);
-    if (k == decKey_ && a.env == decEnv_ && a.song == decSong_) return;
-    runDecisions(*a.env, *a.song, paramsForRate(p, a.sampleRate), dec_);
+    if (k == decKey_ && a.env == decEnv_ && a.song == decSong_ && a.feat == decFeat_) return;
+    runDecisions(*a.env, *a.song, a.feat.get(), paramsForRate(p, a.sampleRate), dec_);
     decKey_ = k;
     decEnv_ = a.env;
     decSong_ = a.song;
+    decFeat_ = a.feat;
 }
 
 void TuneView::updateBatchDecisions(const AppParams& p) {
@@ -437,7 +458,7 @@ void TuneView::updateBatchDecisions(const AppParams& p) {
     for (size_t i = 0; i < batchEntries_.size(); ++i) {
         const auto& e = batchEntries_[i];
         if (!e.env || !e.song) continue;
-        runDecisions(*e.env, *e.song, paramsForRate(p, e.env->sampleRate), dt);
+        runDecisions(*e.env, *e.song, e.feat.get(), paramsForRate(p, e.env->sampleRate), dt);
         auto& s = batchSummary_[i];
         s.syllables = dt.syllables.size();
         s.matches = dt.matchMs.size();
@@ -536,6 +557,48 @@ void TuneView::addCodeFromSyllable(AppParams& p, double tMs) {
     status_ = buf;
 }
 
+void TuneView::setTemplateFromClick(AppParams& p, double tMs, bool add) {
+    const FileAnalysis* a = shown_.get();
+    if (!a || !a->audio) return;
+    std::vector<float> shape;
+    double level = 0.0;
+    if (!templateShapeAt(*a->audio, paramsForRate(p, a->sampleRate), tMs, shape, &level)) {
+        status_ = "Too close to the start or end of the file.";
+        return;
+    }
+    auto& list = p.tmpl.list;
+    int i = *editTmpl_;
+    if (i < 0 || i >= int(list.size())) {
+        if (list.size() >= size_t(kMaxTemplates)) {
+            status_ = "Too many templates.";
+            return;
+        }
+        SpectralTemplate t;
+        int code = 1;
+        for (const auto& o : list) code = std::max(code, o.code + 1);
+        t.code = std::min(code, 255);
+        t.name = "T" + std::to_string(list.size() + 1);
+        list.push_back(t);
+        i = int(list.size()) - 1;
+        *editTmpl_ = i;
+        if (p.tmpl.target < 0) p.tmpl.target = i;
+        add = false;
+    }
+    SpectralTemplate& t = list[size_t(i)];
+    if (!add) t.examples.clear();
+    t.examples.push_back({a->path, tMs});
+    std::string err;
+    if (t.examples.size() == 1)
+        t.shape = shape;
+    else if (!rebuildTemplateShape(t, p, &err))
+        t.shape = shape;
+    char buf[200];
+    std::snprintf(buf, sizeof buf, "%s: %s example at %.3f s (level %.1f dB), %zu example(s)", t.name.c_str(),
+                  add ? "added" : "set to", tMs / 1000.0, level, t.examples.size());
+    status_ = err.empty() ? buf : err;
+    changed() = true;
+}
+
 void TuneView::setEditedFromSyllable(AppParams& p, double tMs) {
     const int best = syllableAt(tMs);
     if (best < 0) return;
@@ -561,8 +624,23 @@ void TuneView::setEditedFromSyllable(AppParams& p, double tMs) {
     status_ = buf;
 }
 
-void TuneView::draw(AppParams& p, int& editSyllable) {
+void TuneView::draw(AppParams& p, int& editSyllable, int& editTemplate) {
     edit_ = &editSyllable;
+    editTmpl_ = &editTemplate;
+    // Template feature settings changed: rebuild the shapes from their examples (once per change).
+    if (p.tmpl.method == DetectMethod::Template) {
+        const int bands = templateBands(p.tmpl);
+        const uint64_t fk = featureKey(p);
+        if (fk != rebuiltFeatKey_) {
+            rebuiltFeatKey_ = fk;
+            for (auto& t : p.tmpl.list)
+                if (!t.examples.empty() && int(t.shape.size()) != bands) {
+                    std::string err;
+                    if (rebuildTemplateShape(t, p, &err)) changed() = true;
+                    else status_ = err;
+                }
+        }
+    }
     drawBrowser(p);
     updateRequests(p);
 
@@ -725,8 +803,14 @@ void TuneView::drawFileView(AppParams& p) {
     ImGui::SetNextItemWidth(5.0f * em());
     ImGui::InputDouble("max Hz", &specMaxHz_, 0, 0, "%.0f");
     specMaxHz_ = std::clamp(specMaxHz_, 1000.0, 50000.0);
-    ImGui::TextDisabled("Drag the green/red lines to change thresholds and band edges. Ctrl+click a syllable: centre "
-                        "the edited syllable on it. Ctrl+Shift+click: add a new syllable. PageUp/PageDown change file.");
+    const bool tmplMode = p.tmpl.method == DetectMethod::Template;
+    if (tmplMode)
+        ImGui::TextDisabled("Templates: Ctrl+click = set the edited template to the sound just before the click (new template "
+                            "if none). Ctrl+Shift+click = add another example to it. Drag its threshold (dashed) on the "
+                            "detection plot. PageUp/PageDown change file.");
+    else
+        ImGui::TextDisabled("Drag the green/red lines to change thresholds and band edges. Ctrl+click a syllable: centre "
+                            "the edited syllable on it. Ctrl+Shift+click: add a new syllable. PageUp/PageDown change file.");
     if (!status_.empty()) {
         ImGui::SameLine();
         ImGui::TextColored(kPurple, "%s", status_.c_str());
@@ -806,6 +890,29 @@ void TuneView::drawFileView(AppParams& p) {
             edge(&p.song.nonBirdCutoffHz, kCyan);
         }
         markers();
+        if (tmplMode) {
+            // The edited template's examples in this file: the analysis window of each.
+            if (*editTmpl_ >= 0 && *editTmpl_ < int(p.tmpl.list.size())) {
+                ImPlot::PushPlotClipRect();
+                const ImPlotRect lim = ImPlot::GetPlotLimits();
+                ImVec4 c = templateColor(*editTmpl_);
+                for (const auto& ex : p.tmpl.list[size_t(*editTmpl_)].examples) {
+                    if (ex.file != a->path) continue;
+                    const ImVec2 p0 = ImPlot::PlotToPixels((ex.ms - p.tmpl.windowMs) / 1000.0, lim.Y.Max);
+                    const ImVec2 p1 = ImPlot::PlotToPixels(ex.ms / 1000.0, lim.Y.Min);
+                    ImPlot::GetPlotDrawList()->AddRectFilled(p0, p1, ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, 0.25f)));
+                    ImPlot::GetPlotDrawList()->AddRect(p0, p1, ImGui::GetColorU32(c));
+                }
+                ImPlot::PopPlotClipRect();
+            }
+            if (ImPlot::IsPlotHovered()) {
+                ImGui::SetTooltip("Ctrl+click: set the edited template to the %.0f ms before the cursor (new template "
+                                  "if none)\nCtrl+Shift+click: add it as another example",
+                                  p.tmpl.windowMs);
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetIO().KeyCtrl)
+                    setTemplateFromClick(p, ImPlot::GetPlotMousePos().x * 1000.0, ImGui::GetIO().KeyShift);
+            }
+        }
         ImPlot::EndPlot();
     }
 
@@ -856,6 +963,47 @@ void TuneView::drawFileView(AppParams& p) {
             changed() = true;
         }
         markers();
+        // Template method: correlation with each template on the right axis (0..1), the
+        // edited one bold with its draggable threshold, and where each was detected
+        // (filled = counted, hollow = failed its timing gate).
+        if (tmplMode && env && !dec_.tmplScores.empty()) {
+            const double dt = env->frameMs() / 1000.0;
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+            for (size_t i = 0; i < dec_.tmplScores.size() && i < p.tmpl.list.size(); ++i) {
+                const auto& sc = dec_.tmplScores[i];
+                if (sc.empty()) continue;
+                const bool ed = int(i) == *editTmpl_;
+                ImVec4 c = templateColor(int(i));
+                c.w = ed ? 1.0f : 0.45f;
+                ImPlot::SetNextLineStyle(c, ed ? 1.8f : 1.0f);
+                const std::string label = p.tmpl.list[i].name + "##tscore" + std::to_string(i);
+                ImPlot::PlotLine(label.c_str(), sc.data(), int(sc.size()), dt, dt);
+            }
+            for (size_t i = 0; i < p.tmpl.list.size(); ++i) {
+                std::vector<double> xg, yg, xu, yu;
+                for (const auto& h : dec_.tmplHits)
+                    if (h.index == int(i)) (h.gated ? xg : xu).push_back(h.ms / 1000.0), (h.gated ? yg : yu).push_back(0.97);
+                const ImVec4 c = templateColor(int(i));
+                const std::string id = "##thit" + std::to_string(i);
+                if (!xg.empty()) {
+                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5, c, 1, c);
+                    ImPlot::PlotScatter(("##g" + id).c_str(), xg.data(), yg.data(), int(xg.size()));
+                }
+                if (!xu.empty()) {
+                    ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5, ImVec4(0, 0, 0, 0), 1.5f, c);
+                    ImPlot::PlotScatter(("##u" + id).c_str(), xu.data(), yu.data(), int(xu.size()));
+                }
+            }
+            if (*editTmpl_ >= 0 && *editTmpl_ < int(p.tmpl.list.size())) {
+                SpectralTemplate& t = p.tmpl.list[size_t(*editTmpl_)];
+                if (ImPlot::DragLineY(102, &t.thresh, templateColor(*editTmpl_), 1.5f)) {
+                    t.thresh = std::clamp(t.thresh, 0.0, 1.0);
+                    changed() = true;
+                }
+            }
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
+        }
+
 
         // Durations (yellow, centred on each syllable) and IOIs (cyan, at each onset), like LabVIEW.
         const ImPlotRect lim = ImPlot::GetPlotLimits();
@@ -871,14 +1019,44 @@ void TuneView::drawFileView(AppParams& p) {
                 if (showIOI_ && !std::isnan(s.ioiMs))
                     ImPlot::Annotation(t, lim.Y.Max, s.matched ? kPurple : kCyan, ImVec2(0, 28), true, "%.0f",
                                        s.ioiMs);
-                if (showCodes_ && s.codeIndex >= 0 && s.codeIndex < int(p.codes.list.size()))
+                if (!tmplMode && showCodes_ && s.codeIndex >= 0 && s.codeIndex < int(p.codes.list.size()))
                     ImPlot::Annotation(t, lim.Y.Max, s.codeIndex == *edit_ ? kAmber : kGreen, ImVec2(0, 46), true,
                                        "%s", p.codes.list[s.codeIndex].name.c_str());
             }
         }
+        if (tmplMode && showCodes_)
+            for (const auto& h : dec_.tmplHits) {
+                const double t = h.ms / 1000.0;
+                if (!h.gated || t < lim.X.Min || t > lim.X.Max || h.index >= int(p.tmpl.list.size())) continue;
+                ImPlot::Annotation(t, lim.Y.Max, templateColor(h.index), ImVec2(0, 46), true, "%s",
+                                   p.tmpl.list[size_t(h.index)].name.c_str());
+            }
 
         // Hover info and Ctrl+click target picking.
-        if (ImPlot::IsPlotHovered()) {
+        if (ImPlot::IsPlotHovered() && tmplMode) {
+            const double tMs = ImPlot::GetPlotMousePos().x * 1000.0;
+            const long k = env ? std::lround(tMs / env->frameMs()) - 1 : -1;
+            std::string info;
+            char buf[160];
+            if (a->feat && k >= 0 && size_t(k) < a->feat->frames() && a->feat->levelDb[size_t(k)] > -1e8f) {
+                std::snprintf(buf, sizeof buf, "level %.1f dB (min %.0f)\n", a->feat->levelDb[size_t(k)],
+                              p.tmpl.minLevelDb);
+                info += buf;
+            }
+            for (size_t i = 0; i < dec_.tmplScores.size() && i < p.tmpl.list.size(); ++i)
+                if (k >= 0 && size_t(k) < dec_.tmplScores[i].size()) {
+                    std::snprintf(buf, sizeof buf, "%s: %.2f (thresh %.2f)\n", p.tmpl.list[i].name.c_str(),
+                                  dec_.tmplScores[i][size_t(k)], p.tmpl.list[i].thresh);
+                    info += buf;
+                }
+            const bool hasEdit = *editTmpl_ >= 0 && *editTmpl_ < int(p.tmpl.list.size());
+            info += hasEdit ? "Ctrl+click: make '" + p.tmpl.list[size_t(*editTmpl_)].name +
+                                  "' this sound (the window just before the cursor)\nCtrl+Shift+click: add as another example"
+                            : std::string("Ctrl+click: new template from this sound (the window just before the cursor)");
+            ImGui::SetTooltip("%s", info.c_str());
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && ImGui::GetIO().KeyCtrl)
+                setTemplateFromClick(p, tMs, ImGui::GetIO().KeyShift);
+        } else if (ImPlot::IsPlotHovered()) {
             const double tMs = ImPlot::GetPlotMousePos().x * 1000.0;
             for (const auto& s : dec_.syllables)
                 if (tMs >= s.onsetMs && (std::isnan(s.offsetMs) || tMs <= s.offsetMs)) {
@@ -1145,7 +1323,7 @@ void TuneView::drawFolderSummary(AppParams& p) {
     HelpMarker("Computes the detection signal and song detector for every file (the slow part, using all CPU cores). "
                "After that, changing thresholds, setpoints or feedback settings re-runs the decisions on every file "
                "instantly. Changing bands, gains or song-detector settings needs another 'Analyze folder'.");
-    const bool stale = !batchEntries_.empty() && (batchEnvKey_ != envelopeKey(p) || batchSongKey_ != songKey(p));
+    const bool stale = !batchEntries_.empty() && (batchEnvKey_ != tracksKey(p) || batchSongKey_ != songKey(p));
     if (stale) {
         ImGui::SameLine();
         ImGui::TextColored(kAmber, "Band / gain / song settings changed since this analysis: re-analyze to update.");

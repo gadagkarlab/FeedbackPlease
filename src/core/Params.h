@@ -202,6 +202,45 @@ struct SyllableCodeParams {
 // The target syllable, or nullptr if none / out of range.
 const SyllableCode* targetSyllable(const SyllableCodeParams& p);
 
+// ---- Spectral templates (alternative to IOI / SD sequences)
+// Every frame, the spectrum of the last windowMs is reduced to log power in bands of
+// bandHz between lowHz and highHz, normalized (mean removed, unit length), and
+// correlated with each template: 1 = same spectral shape, regardless of loudness.
+// A template is detected when its correlation stays >= thresh for minFrames frames in
+// a row while the level is above minLevelDb. Like EvTAF (Tumer & Brainard 2007).
+enum class DetectMethod : int { Sequence = 0, Template = 1 };
+constexpr int kMaxTemplates = 16;
+
+struct TemplateExample {
+    std::string file;  // recording the template was taken from
+    double ms = 0.0;   // end of the analysis window in that file
+};
+
+struct SpectralTemplate {
+    std::string name = "template";
+    int code = 1;  // value written to the syllable code port
+    bool enabled = true;
+    double thresh = 0.9;   // correlation needed, -1..1
+    int minFrames = 3;     // consecutive frames at or above thresh
+    // Optional timing gate: only counts if template gateIndex was detected between
+    // gateMinMs and gateMaxMs earlier. -1 = no gate.
+    int gateIndex = -1;
+    double gateMinMs = 50.0, gateMaxMs = 150.0;
+    std::vector<TemplateExample> examples;  // averaged into shape
+    std::vector<float> shape;               // normalized band log-powers (see above)
+};
+
+struct TemplateParams {
+    DetectMethod method = DetectMethod::Sequence;
+    double windowMs = 12.0;
+    double lowHz = 500.0, highHz = 10000.0, bandHz = 125.0;
+    double minLevelDb = -50.0;  // RMS between lowHz and highHz, dB re 1 V (before software gain)
+    double rearmMs = 30.0;      // a template can't be detected again sooner than this
+    std::vector<SpectralTemplate> list;
+    int target = 0;  // index into list that triggers feedback; -1 = none
+};
+int templateBands(const TemplateParams& t);  // number of bands (length of a shape)
+
 struct DisplayParams {
     double windowSec = 2.0;
     bool rawAutoY = true;
@@ -234,6 +273,7 @@ struct AppParams {
     FeedbackParams fb;
     SongParams song;
     SyllableCodeParams codes;
+    TemplateParams tmpl;
     PulseFeedbackParams pulse;
     DisplayParams display;
     RecordingParams rec;
@@ -261,5 +301,6 @@ const char* toString(TerminalConfig t);
 const char* toString(SongRatioMode m);
 const char* toString(SylCodeHold h);
 const char* toString(RangeMode m);
+const char* toString(DetectMethod m);
 
 }  // namespace fp

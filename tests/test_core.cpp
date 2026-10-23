@@ -6,6 +6,7 @@
 #include <complex>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -301,7 +302,7 @@ static void testOfflineMatchesRealtime() {
     DecisionTrack dt;
     CHECK(computeEnvelopeTrack(song, pr, env));
     computeSongTrack(song, pr, st);
-    runDecisions(env, st, pr, dt, 99);
+    runDecisions(env, st, nullptr, pr, dt, 99);
 
     CHECK(env.value == rtValue);  // bit-identical
     std::vector<double> offOnsets;
@@ -333,7 +334,7 @@ static void testTargetIsFirstMatch() {
     computeEnvelopeTrack(song, pr0, env);
     computeSongTrack(song, pr0, st);
     DecisionTrack a, b, c;
-    runDecisions(env, st, pr0, a);  // default: target is the only syllable
+    runDecisions(env, st, nullptr, pr0, a);  // default: target is the only syllable
     CHECK(a.matchMs.size() >= 7);
 
     AppParams p2 = p;  // a broad "any IOI 50-200 ms" syllable listed before the target swallows it
@@ -346,18 +347,18 @@ static void testTargetIsFirstMatch() {
     any.ioi.maxMs = 200;
     p2.codes.list.insert(p2.codes.list.begin(), any);
     p2.codes.target = 1;
-    runDecisions(env, st, paramsForRate(p2, p.hw.sampleRate), b);
+    runDecisions(env, st, nullptr, paramsForRate(p2, p.hw.sampleRate), b);
     CHECK(b.matchMs.empty() && b.fire1Ms.empty());
 
     p2.codes.target = 0;  // now "any" itself is the target: every classified syllable
-    runDecisions(env, st, paramsForRate(p2, p.hw.sampleRate), c);
+    runDecisions(env, st, nullptr, paramsForRate(p2, p.hw.sampleRate), c);
     size_t classified = 0;
     for (const auto& s : c.syllables) classified += s.codeIndex == 0;
     // Early-bout matches can be blocked by the song gate, so count both.
     CHECK(c.matchMs.size() + c.blockedMs.size() == classified && classified > a.matchMs.size());
 
     p2.codes.target = -1;  // no target: no feedback at all
-    runDecisions(env, st, paramsForRate(p2, p.hw.sampleRate), c);
+    runDecisions(env, st, nullptr, paramsForRate(p2, p.hw.sampleRate), c);
     CHECK(c.matchMs.empty() && c.fire1Ms.empty());
 }
 
@@ -453,7 +454,7 @@ static void testSyllableCodesOnSong() {
     DecisionTrack dt;
     computeEnvelopeTrack(song, pr, env);
     computeSongTrack(song, pr, st);
-    runDecisions(env, st, pr, dt);
+    runDecisions(env, st, nullptr, pr, dt);
     int counts[6] = {0};
     int unlabeled = 0;
     std::string seq;
@@ -661,6 +662,95 @@ static void testParamsRoundTrip() {
 
 
 
+static void testSpectralTemplates() {
+    AppParams p;
+    p.tmpl.method = DetectMethod::Template;
+    const double fs = p.hw.sampleRate;
+    const auto song = synthesizeSong(fs, 10.0, p.source.simNoiseVolts);
+    // Motif every 1189 ms from 200 ms: A 200-250, B 290-350, C 385-468 ms (see defaultMotif()).
+    const AppParams pr = paramsForRate(p, fs);
+    SpectralTemplate a, c;
+    a.name = "A";
+    a.code = 1;
+    c.name = "C";
+    c.code = 3;
+    CHECK(templateShapeAt(song, pr, 220.0, a.shape));
+    CHECK(templateShapeAt(song, pr, 410.0, c.shape));
+    CHECK(int(c.shape.size()) == templateBands(p.tmpl));
+    p.tmpl.list = {a, c};
+    p.tmpl.target = 1;
+
+    // Offline (feature track + decisions) and real time must agree exactly.
+    auto offline = [&](const AppParams& q, DecisionTrack& dt) {
+        const AppParams qr = paramsForRate(q, fs);
+        EnvelopeTrack env;
+        SongTrack st;
+        FeatureTrack ft;
+        computeEnvelopeTrack(song, qr, env);
+        computeSongTrack(song, qr, st);
+        computeFeatureTrack(song, qr, ft);
+        runDecisions(env, st, &ft, qr, dt);
+    };
+    DecisionTrack dt;
+    offline(p, dt);
+    std::vector<double> live;
+    Detector det;
+    det.setParams(p);
+    const int n = p.hw.samplesPerFrame;
+    for (size_t i = 0; i + size_t(n) <= song.size(); i += size_t(n))
+        if (det.process(&song[i], n).match.match) live.push_back(double(i + size_t(n)) * 1000.0 / fs);
+    std::vector<double> matches = dt.matchMs;
+    matches.insert(matches.end(), dt.blockedMs.begin(), dt.blockedMs.end());
+    std::sort(matches.begin(), matches.end());
+    CHECK(matches == live);
+
+    // One detection of C per motif, a few ms after the point the template was taken from.
+    int c3 = 0, wrong = 0;
+    double worst = 0;
+    for (const auto& h : dt.tmplHits) {
+        if (h.index != 1) continue;
+        const double k = std::round((h.ms - 410.0) / 1189.0), err = h.ms - (410.0 + k * 1189.0);
+        if (std::abs(err) < 20) ++c3, worst = std::max(worst, std::abs(err));
+        else ++wrong;
+    }
+    const int motifs = 8;  // full motifs in 10 s
+    std::printf("  template C: %d hits on C (worst %.1f ms from the template point), %d elsewhere; %zu matches\n", c3,
+                worst, wrong, matches.size());
+    CHECK(c3 >= motifs && wrong == 0);
+
+    // Timing gate: C after A (A at +20 ms, C at +210 ms into the motif).
+    p.tmpl.list[1].gateIndex = 0;
+    p.tmpl.list[1].gateMinMs = 150;
+    p.tmpl.list[1].gateMaxMs = 230;
+    DecisionTrack g1, g2;
+    offline(p, g1);
+    p.tmpl.list[1].gateMinMs = 10;
+    p.tmpl.list[1].gateMaxMs = 50;
+    offline(p, g2);
+    std::printf("  gate 150-230 ms: %zu matches, gate 10-50 ms: %zu\n", g1.matchMs.size() + g1.blockedMs.size(),
+                g2.matchMs.size() + g2.blockedMs.size());
+    CHECK(g1.matchMs.size() + g1.blockedMs.size() == matches.size());
+    CHECK(g2.matchMs.empty() && g2.blockedMs.empty());
+
+    // Settings round trip, shape included.
+    std::ostringstream os;
+    writeParams(os, p);
+    const std::string path = "fp_tmpl_test.ini";
+    {
+        std::ofstream f(path);
+        f << os.str();
+    }
+    AppParams q;
+    CHECK(loadParams(path, q));
+    std::remove(path.c_str());
+    CHECK(q.tmpl.method == DetectMethod::Template && q.tmpl.list.size() == 2 && q.tmpl.target == 1);
+    CHECK(q.tmpl.list[1].shape.size() == p.tmpl.list[1].shape.size() && q.tmpl.list[1].gateIndex == 0);
+    double maxDiff = 0;
+    for (size_t i = 0; i < q.tmpl.list[1].shape.size(); ++i)
+        maxDiff = std::max(maxDiff, double(std::abs(q.tmpl.list[1].shape[i] - p.tmpl.list[1].shape[i])));
+    CHECK(maxDiff < 1e-5);
+}
+
 int main() {
     std::printf("BandEnvelope\n");
     testBandEnvelopeSine();
@@ -692,6 +782,8 @@ int main() {
     testParamSections();
     std::printf("Params round trip\n");
     testParamsRoundTrip();
+    std::printf("Spectral templates\n");
+    testSpectralTemplates();
     if (g_failures) {
         std::printf("%d check(s) FAILED\n", g_failures);
         return 1;

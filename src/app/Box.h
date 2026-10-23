@@ -72,6 +72,7 @@ struct ScopeSnapshot {
     std::vector<float> songFrac;   // per frame: fraction of kernel above ratio threshold
     std::vector<float> songRatio;  // per frame: latest power ratio
     std::vector<float> songOn;     // per frame: 0/1 song active
+    std::vector<float> tmplScore;  // per frame: correlation with the target template (template method)
     std::vector<double> matchT, fireT, suppressT, blockedT;  // seconds, same clock as tEndSec
 };
 
@@ -203,7 +204,7 @@ private:
     // Shared with the GUI.
     mutable std::mutex mx_;
     EngineStats stats_;
-    Ring<float> raw_, env_, syl_, songFrac_, songRatio_, songOn_;
+    Ring<float> raw_, env_, syl_, songFrac_, songRatio_, songOn_, tmplScore_;
     std::deque<double> matchT_, fireT_, suppressT_, blockedT_;
     std::deque<LogEvent> events_;
     std::string error_;

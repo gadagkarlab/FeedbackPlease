@@ -209,6 +209,7 @@ void Gui::copyParts(const AppParams& from, AppParams& to, const CopyParts& c) {
     if (c.syllables) {
         to.codes.list = from.codes.list;  // the box keeps its own code-port settings
         to.codes.target = from.codes.target;
+        to.tmpl = from.tmpl;  // detection method + spectral templates
     }
     if (c.song) to.song = from.song;
     if (c.feedback) {
@@ -278,7 +279,7 @@ void Gui::draw() {
         }
         if (ImGui::BeginTabItem("Tune on recordings", nullptr, selectTuneTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
             tab = 1;
-            tune_.draw(tuneP_, editSyl_);
+            tune_.draw(tuneP_, editSyl_, editTmpl_);
             ImGui::EndTabItem();
         }
 #ifdef FP_CLOSEDLOOP
@@ -541,7 +542,7 @@ void Gui::drawTuneHeader() {
                "current settings.");
     auto partsUi = [&](CopyParts& c) {
         ImGui::Checkbox("Detection (bands, gains, thresholds)", &c.detection);
-        ImGui::Checkbox("Syllables & target", &c.syllables);
+        ImGui::Checkbox("Syllables / templates & target", &c.syllables);
         ImGui::Checkbox("Song detector", &c.song);
         ImGui::Checkbox("Feedback timing (not the wave files)", &c.feedback);
     };
@@ -599,8 +600,16 @@ void Gui::drawTuneHeader() {
 void Gui::drawControls() {
     const ImGuiTreeNodeFlags open = ImGuiTreeNodeFlags_DefaultOpen;
     if (ImGui::CollapsingHeader("Syllables & Target", open)) {
-        drawTarget();
-        drawCodes();
+        if (EnumCombo("Detection method", &P().tmpl.method, 2, 14)) changed() = true;
+        HelpMarker("Syllable sequence: syllables are segmented with the start / end thresholds and recognized by "
+                   "their IOI and SD.\nSpectral templates: the spectrum of the last few ms is compared with stored "
+                   "templates every frame; no segmentation needed (like EvTAF).");
+        if (P().tmpl.method == DetectMethod::Template) {
+            drawTemplates();
+        } else {
+            drawTarget();
+            drawCodes();
+        }
     }
     if (ImGui::CollapsingHeader("Spectrum Selection")) drawSpectrum();
     if (ImGui::CollapsingHeader("Processing Params")) drawProcessing();
@@ -863,6 +872,136 @@ void Gui::drawPulseFeedback() {
     if (q.enabled && P().hw.aoChannel.empty()) ImGui::TextColored(kRed, "Set the AO channel under Hardware / Source.");
     if (q.enabled && q.diLine.empty()) ImGui::TextColored(kRed, "Set the pulse input line.");
     ImGui::EndDisabled();
+}
+
+void Gui::drawTemplates() {
+    auto& t = P().tmpl;
+    const int bands = templateBands(t);
+
+    // Feedback target
+    const std::string current = t.target >= 0 && t.target < int(t.list.size())
+                                    ? t.list[size_t(t.target)].name + "  (code " + std::to_string(t.list[size_t(t.target)].code) + ")"
+                                    : std::string("none (no feedback)");
+    ImGui::SetNextItemWidth(14 * em());
+    if (ImGui::BeginCombo("Feedback target##tmpl", current.c_str())) {
+        if (ImGui::Selectable("none (no feedback)", t.target < 0)) t.target = -1, changed() = true;
+        for (int i = 0; i < int(t.list.size()); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(t.list[size_t(i)].name.c_str(), i == t.target)) t.target = i, changed() = true;
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    HelpMarker("Feedback is triggered when this template is detected (and passes its timing gate, if it has one).");
+
+    ImGui::SeparatorText("Spectrum compared");
+    InputD("window (ms)##tmpl", &t.windowMs, "%.3g", 4);
+    t.windowMs = std::clamp(t.windowMs, 2.0, 50.0);
+    ImGui::SameLine();
+    InputD("band (Hz)##tmpl", &t.bandHz, "%.0f", 4);
+    t.bandHz = std::clamp(t.bandHz, 20.0, 2000.0);
+    InputD("from (Hz)##tmpl", &t.lowHz, "%.0f", 4);
+    ImGui::SameLine();
+    InputD("to (Hz)##tmpl", &t.highHz, "%.0f", 4);
+    t.lowHz = std::clamp(t.lowHz, 0.0, 50000.0);
+    t.highHz = std::clamp(t.highHz, t.lowHz + 100.0, 50000.0);
+    ImGui::TextDisabled("%d bands", bands);
+    HelpMarker("Every frame, the spectrum of the last 'window' ms is cut into bands of 'band' Hz between 'from' and "
+               "'to', in log power, and correlated with each template (1 = identical shape, regardless of "
+               "loudness). Changing these rebuilds the templates from their examples (in the Tune tab).");
+    InputD("min level (dB)##tmpl", &t.minLevelDb, "%.0f", 4);
+    HelpMarker("Nothing is detected while the RMS between 'from' and 'to' is below this (dB re 1 V at the input). "
+               "Keeps background noise from matching. Hover the detection plot in the Tune tab to read levels.");
+    ImGui::SameLine();
+    InputD("re-arm (ms)##tmpl", &t.rearmMs, "%.0f", 4);
+    t.rearmMs = std::clamp(t.rearmMs, 0.0, 2000.0);
+    HelpMarker("A template is detected once per stretch above its threshold, and not again within this time.");
+
+    ImGui::SeparatorText("Templates");
+    HelpMarker("Make one in the Tune tab: Ctrl+click on the spectrogram or detection plot just after the part of the "
+               "syllable you want (the template is the window before the cursor). Ctrl+Shift+click adds more "
+               "examples, which are averaged: a few examples from different renditions make it more robust.\n\n"
+               "A template is detected when its correlation stays at or above the threshold for 'frames' frames in "
+               "a row. A timing gate makes it count only if another template was detected the given time earlier, "
+               "to tell apart syllables that look alike.");
+    int remove = -1;
+    for (int i = 0; i < int(t.list.size()); ++i) {
+        auto& e = t.list[size_t(i)];
+        ImGui::PushID(i);
+        const std::string header = std::string(i == t.target ? "* " : "  ") + e.name + "  (code " +
+                                   std::to_string(e.code) + ")" + (e.enabled ? "" : "  [off]") + "###thdr";
+        const bool open = ImGui::TreeNodeEx(header.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed |
+                                                                (i == editTmpl_ ? ImGuiTreeNodeFlags_Selected : 0));
+        if (ImGui::IsItemClicked()) editTmpl_ = i;
+        if (!open) {
+            ImGui::PopID();
+            continue;
+        }
+        Check("##en", &e.enabled);
+        ImGui::SameLine();
+        InputStr("##name", &e.name, 6);
+        ImGui::SameLine();
+        if (InputI("code", &e.code, 3)) e.code = std::clamp(e.code, 1, 255);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) remove = i;
+        InputD("threshold", &e.thresh, "%.3f", 4);
+        e.thresh = std::clamp(e.thresh, 0.0, 1.0);
+        ImGui::SameLine();
+        if (InputI("frames", &e.minFrames, 3)) e.minFrames = std::clamp(e.minFrames, 1, 100);
+        // Timing gate
+        const std::string gate = e.gateIndex >= 0 && e.gateIndex < int(t.list.size()) && e.gateIndex != i
+                                     ? "after " + t.list[size_t(e.gateIndex)].name
+                                     : std::string("no timing gate");
+        ImGui::SetNextItemWidth(9 * em());
+        if (ImGui::BeginCombo("##gate", gate.c_str())) {
+            if (ImGui::Selectable("no timing gate", e.gateIndex < 0)) e.gateIndex = -1, changed() = true;
+            for (int j = 0; j < int(t.list.size()); ++j) {
+                if (j == i) continue;
+                ImGui::PushID(j);
+                if (ImGui::Selectable(("after " + t.list[size_t(j)].name).c_str(), j == e.gateIndex))
+                    e.gateIndex = j, changed() = true;
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        if (e.gateIndex >= 0) {
+            ImGui::SameLine();
+            InputD("to##gmin", &e.gateMinMs, "%.0f", 3.5f);
+            ImGui::SameLine();
+            InputD("ms earlier##gmax", &e.gateMaxMs, "%.0f", 3.5f);
+            e.gateMaxMs = std::max(e.gateMaxMs, e.gateMinMs);
+        }
+        ImGui::TextDisabled("%zu example(s)", e.examples.size());
+        if (int(e.shape.size()) != bands) {
+            ImGui::SameLine();
+            ImGui::TextColored(kAmber, e.shape.empty() ? "empty: Ctrl+click in the Tune tab" : "spectrum settings changed");
+            if (!e.examples.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Rebuild")) {
+                    std::string err;
+                    if (rebuildTemplateShape(e, P(), &err)) changed() = true;
+                    else status_ = err;
+                }
+            }
+        }
+        ImGui::TreePop();
+        ImGui::PopID();
+    }
+    if (remove >= 0) {
+        t.list.erase(t.list.begin() + remove);
+        // Indices after the removed one shift down; references to it are dropped.
+        auto fix = [&](int& idx) { idx = idx == remove ? -1 : idx > remove ? idx - 1 : idx; };
+        fix(t.target);
+        for (auto& e : t.list) fix(e.gateIndex);
+        if (editTmpl_ >= int(t.list.size())) editTmpl_ = int(t.list.size()) - 1;
+        changed() = true;
+    }
+    if (t.list.size() < size_t(kMaxTemplates) && ImGui::Button("+ New template")) {
+        editTmpl_ = -1;  // the next Ctrl+click in the Tune tab creates it
+        status_ = "Ctrl+click a sound in the Tune tab to create the template.";
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The next Ctrl+click in the Tune tab creates a new template from that sound.");
 }
 
 void Gui::drawCodes() {
@@ -1243,6 +1382,21 @@ void Gui::drawPlots(float height) {
             ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
             ImPlot::SetNextLineStyle(kAmber, 1.5f);
             ImPlot::PlotLine("signal", xs_.data(), ys_.data(), int(m));
+        }
+        // Template method: the target template's correlation (right axis, 0..1) and its threshold.
+        const auto& tp = P().tmpl;
+        if (tp.method == DetectMethod::Template && snap_.tmplScore.size() == m && m > 0) {
+            std::vector<double> sc(m);
+            for (size_t i = 0; i < m; ++i) sc[i] = snap_.tmplScore[i];
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
+            ImPlot::SetNextLineStyle(kPurple, 1.5f);
+            ImPlot::PlotLine("template score", xs_.data(), sc.data(), int(m));
+            if (tp.target >= 0 && tp.target < int(tp.list.size())) {
+                const double th = tp.list[size_t(tp.target)].thresh;
+                ImPlot::SetNextLineStyle(ImVec4(0.65f, 0.45f, 1.0f, 0.6f), 1.0f);
+                ImPlot::PlotInfLines("template thresh", &th, 1, ImPlotInfLinesFlags_Horizontal);
+            }
+            ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
         }
         const double th[2] = {Detector::toDisplay(P().spectrum.sylStartThresh, dB),
                               Detector::toDisplay(P().spectrum.sylEndThresh, dB)};

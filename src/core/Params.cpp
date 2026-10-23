@@ -138,6 +138,49 @@ void visitParams(AppParams& p, F&& f) {
         }
     }
 
+    f("tmpl.method", p.tmpl.method);
+    f("tmpl.window_ms", p.tmpl.windowMs);
+    f("tmpl.low_hz", p.tmpl.lowHz);
+    f("tmpl.high_hz", p.tmpl.highHz);
+    f("tmpl.band_hz", p.tmpl.bandHz);
+    f("tmpl.min_level_db", p.tmpl.minLevelDb);
+    f("tmpl.rearm_ms", p.tmpl.rearmMs);
+    f("tmpl.target", p.tmpl.target);
+    int nTmpl = int(p.tmpl.list.size());
+    f("tmpl.count", nTmpl);
+    p.tmpl.list.resize(size_t(std::clamp(nTmpl, 0, kMaxTemplates)));
+    for (size_t i = 0; i < p.tmpl.list.size(); ++i) {
+        auto& t = p.tmpl.list[i];
+        const std::string k = "tmpl." + std::to_string(i);
+        f(k + ".name", t.name);
+        f(k + ".code", t.code);
+        f(k + ".enabled", t.enabled);
+        f(k + ".thresh", t.thresh);
+        f(k + ".min_frames", t.minFrames);
+        f(k + ".gate_index", t.gateIndex);
+        f(k + ".gate_min_ms", t.gateMinMs);
+        f(k + ".gate_max_ms", t.gateMaxMs);
+        int nEx = int(t.examples.size());
+        f(k + ".example_count", nEx);
+        t.examples.resize(size_t(std::clamp(nEx, 0, 1000)));
+        for (size_t j = 0; j < t.examples.size(); ++j) {
+            const std::string ke = k + ".example." + std::to_string(j);
+            f(ke + ".file", t.examples[j].file);
+            f(ke + ".ms", t.examples[j].ms);
+        }
+        // The shape as one line of numbers (written as text, parsed back on load).
+        std::string shape;
+        for (float v : t.shape) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%s%.6g", shape.empty() ? "" : " ", v);
+            shape += buf;
+        }
+        f(k + ".shape", shape);
+        std::istringstream is(shape);
+        t.shape.clear();
+        for (float v; is >> v;) t.shape.push_back(v);
+    }
+
     f("display.window_sec", p.display.windowSec);
     f("display.raw_auto_y", p.display.rawAutoY);
     f("display.raw_y_range", p.display.rawYRange);
@@ -270,6 +313,7 @@ std::string readParams(const ParamMap& kv, AppParams& p, const std::string& pref
         p.codes.target = 0;
     }
     if (p.codes.target >= int(p.codes.list.size())) p.codes.target = -1;
+    if (p.tmpl.target >= int(p.tmpl.list.size())) p.tmpl.target = -1;
     return localErr;
 }
 
@@ -284,6 +328,11 @@ bool loadParams(const std::string& path, AppParams& p, std::string* err) {
 void writeParams(std::ostream& os, const AppParams& p, const std::string& prefix) {
     AppParams copy = p;
     visitParams(copy, Saver{os, prefix});
+}
+
+int templateBands(const TemplateParams& t) {
+    if (t.bandHz <= 0 || t.highHz <= t.lowHz) return 0;
+    return std::clamp(int(std::ceil((t.highHz - t.lowHz) / t.bandHz - 1e-9)), 1, 1024);
 }
 
 SyllableCode defaultTargetSyllable() {
@@ -377,6 +426,14 @@ bool usesSd(TriggerType t) { return t != TriggerType::IOI; }
 bool usesPrevIoi(TriggerType t) { return t == TriggerType::IOI_SD_IOI; }
 bool isOnsetEvaluated(TriggerType t) {
     return t == TriggerType::IOI || t == TriggerType::SD_IOI || t == TriggerType::IOI_SD_IOI;
+}
+
+const char* toString(DetectMethod m) {
+    switch (m) {
+        case DetectMethod::Sequence: return "Syllable sequence (IOI / SD)";
+        case DetectMethod::Template: return "Spectral templates";
+    }
+    return "?";
 }
 
 const char* toString(RangeMode m) {

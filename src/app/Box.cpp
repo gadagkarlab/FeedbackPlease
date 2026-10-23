@@ -171,7 +171,7 @@ bool Box::begin(const AppParams& p, const std::string& backend, const std::strin
         stats_.frameSamples = n;
         raw_.reset(size_t(fs_ * kScopeSeconds));
         const double frameRate = fs_ / n;
-        for (auto* r : {&env_, &syl_, &songFrac_, &songRatio_, &songOn_}) r->reset(size_t(frameRate * kScopeSeconds));
+        for (auto* r : {&env_, &syl_, &songFrac_, &songRatio_, &songOn_, &tmplScore_}) r->reset(size_t(frameRate * kScopeSeconds));
         matchT_.clear();
         fireT_.clear();
         suppressT_.clear();
@@ -327,6 +327,9 @@ void Box::process(const float* x, int n, IOBackend& io, size_t backlogSamples) {
     if (r.sylCode.evaluated) {
         codeNext = r.sylCode.code;
         codePulseLeftMs_ = p.codes.pulseMs;
+    } else if (r.tmpl.index >= 0) {  // template method: set when a template is detected
+        codeNext = r.tmpl.code;
+        codePulseLeftMs_ = p.codes.pulseMs;
     } else if (p.codes.hold == SylCodeHold::UntilOffset && r.seg.offset) {
         codeNext = 0;
     } else if (p.codes.hold == SylCodeHold::Pulse) {
@@ -383,12 +386,24 @@ void Box::process(const float* x, int n, IOBackend& io, size_t backlogSamples) {
             ++codeUnmatched_;
         }
     }
+    if (p.tmpl.method == DetectMethod::Template)
+        for (const auto& h : det_->templateMatcher().hits())
+            if (h.index < int(p.tmpl.list.size()))
+                logEvent(t, "template",
+                         p.tmpl.list[size_t(h.index)].name + fmt("  (code %.0f)", double(p.tmpl.list[size_t(h.index)].code)) +
+                             (h.gated ? "" : "  not counted: timing gate"),
+                         r.tmpl.levelDb);
     if (r.match.match) {
         ++matches_;
         if (r.matchBlocked) ++blocked_;
         const SyllableCode* tgt = targetSyllable(p.codes);
+        const bool tm = p.tmpl.method == DetectMethod::Template;
+        const std::string tname = tm ? (p.tmpl.target >= 0 && p.tmpl.target < int(p.tmpl.list.size())
+                                            ? p.tmpl.list[size_t(p.tmpl.target)].name
+                                            : std::string())
+                                     : (tgt ? tgt->name : std::string());
         logEvent(t, "match",
-                 (tgt ? "target " + tgt->name : std::string("target")) + (r.matchBlocked ? "  (blocked: no song)" : ""),
+                 "target " + tname + (r.matchBlocked ? "  (blocked: no song)" : ""),
                  r.value);
     }
     if (r.fb.trialStarted) ++trials_;
@@ -428,6 +443,7 @@ void Box::process(const float* x, int n, IOBackend& io, size_t backlogSamples) {
     songFrac_.push(float(r.song.fraction));
     songRatio_.push(float(r.song.ratio));
     songOn_.push(r.song.active ? 1.0f : 0.0f);
+    tmplScore_.push(float(r.tmpl.targetScore));
     const double ts = t / 1000.0;
     if (r.match.match) (r.matchBlocked ? blockedT_ : matchT_).push_back(ts);
     if (r.fb.fire || pulseFire) fireT_.push_back(ts);
@@ -499,6 +515,7 @@ void Box::snapshot(double seconds, ScopeSnapshot& out) const {
     songFrac_.copyLast(size_t(seconds * out.envRate), out.songFrac);
     songRatio_.copyLast(size_t(seconds * out.envRate), out.songRatio);
     songOn_.copyLast(size_t(seconds * out.envRate), out.songOn);
+    tmplScore_.copyLast(size_t(seconds * out.envRate), out.tmplScore);
     out.matchT.assign(matchT_.begin(), matchT_.end());
     out.blockedT.assign(blockedT_.begin(), blockedT_.end());
     out.fireT.assign(fireT_.begin(), fireT_.end());

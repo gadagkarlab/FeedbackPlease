@@ -11,6 +11,7 @@
 #include "core/FeedbackStateMachine.h"
 #include "core/Params.h"
 #include "core/SongDetector.h"
+#include "core/SpectralTemplate.h"
 #include "core/SyllableCodes.h"
 #include "core/Syllables.h"
 
@@ -26,7 +27,8 @@ struct FrameResult {
     double subtractAmp = 0.0;
     SegmenterOutput seg;
     MatchResult match;      // the target syllable was recognized
-    SylCodeResult sylCode;  // syllable classification at each IOI end
+    SylCodeResult sylCode;  // syllable classification at each IOI end (sequence method)
+    TemplateResult tmpl;    // spectral template detection (template method)
     SongState song;
     bool songGateOpen = true;  // matches may start feedback trials
     bool matchBlocked = false; // a match happened but no song was detected
@@ -47,7 +49,10 @@ public:
     // The decision half of process(): segmentation, sequence match, song gate and
     // feedback state machine, given an already computed detection value and song
     // state. Used to replay precomputed envelopes when tuning offline.
-    FrameResult decide(uint64_t sampleEnd, double value, const SongState& song, double dtMs);
+    // shape / levelDb: TemplateFeatures output for the template method (nullptr if not ready).
+    FrameResult decide(uint64_t sampleEnd, double value, const SongState& song, double dtMs,
+                       const float* shape = nullptr, double levelDb = -200.0);
+    const TemplateMatcher& templateMatcher() const { return matcher_; }
 
     static int windowSamplesFor(const AppParams& p);
 
@@ -65,9 +70,13 @@ private:
     SyllableClassifier classifier_;
     SongDetector song_;
     FeedbackStateMachine fsm_;
+    TemplateFeatures feat_;
+    TemplateMatcher matcher_;
+    std::vector<float> shape_;
 
     int windowN_ = 0;
-    std::vector<float> ring_;  // 2*windowN_, each sample written twice so the window is contiguous
+    int ringN_ = 0;  // longest window (detection or template)
+    std::vector<float> ring_;  // 2*ringN_, each sample written twice so any window is contiguous
     int head_ = 0;
     int filled_ = 0;
     uint64_t samples_ = 0;
