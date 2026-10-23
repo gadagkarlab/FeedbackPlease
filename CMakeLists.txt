@@ -113,6 +113,10 @@ if(FP_BUILD_GUI)
     src/app/CrashHandler.cpp)
   target_link_libraries(FeedbackPlease PRIVATE fp_engine imgui_lib)
 
+  if(WIN32)
+    target_sources(FeedbackPlease PRIVATE src/app/FeedbackPlease.rc)  # icon
+  endif()
+
   # MSN finder tab: drives tools/msn_finder/msn_server.py (numpy + scipy) as a child process.
   if(WIN32)
     target_sources(FeedbackPlease PRIVATE src/app/MsnFinder.cpp src/app/MsnFinderView.cpp)

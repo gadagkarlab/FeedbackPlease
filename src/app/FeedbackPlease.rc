@@ -1,0 +1,3 @@
+// Windows resources. GLFW_ICON is the exe icon (Explorer, taskbar, shortcuts) and GLFW uses
+// it for the window too. Regenerate the .ico with tools/icon/make_icon.ps1.
+GLFW_ICON ICON "../../assets/FeedbackPlease.ico"
