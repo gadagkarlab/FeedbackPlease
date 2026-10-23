@@ -25,13 +25,64 @@ Outputs in `build/Release/`:
 
 | Executable | Purpose |
 |---|---|
-| `FeedbackPlease.exe` | The app. `FeedbackPlease.exe [settings.ini] [--autostart]` |
+| `FeedbackPlease.exe` | The app. `FeedbackPlease.exe [settings.ini] [--mode M] [--autostart]`, M = single, closedloop or multi (see *Launch modes*) |
 | `offline_detect.exe` | Runs the detector over a WAV file as fast as possible, writes events + envelope CSVs. Use it to tune thresholds on recorded song. |
 | `fp_tests.exe` | Unit tests for the DSP, segmentation, sequence matching and state machine. |
 | `fp_engine_test.exe` | Runs the real-time engine headless on simulated song for 4 s and lists the NI devices it can see. |
 | `make_test_wavs.exe` | Writes a folder of synthetic recordings (song bouts, calls, cage noise) for trying the Tune tab. |
 
 Build without hardware support with `-DFP_WITH_DAQMX=OFF`, or without the GUI with `-DFP_BUILD_GUI=OFF`.
+
+## Launch modes
+
+`FeedbackPlease.exe` opens on a launch screen with three choices:
+
+| Mode | Tabs | For |
+|---|---|---|
+| **1. Single box** | Live, Tune | one box: microphone, detection, feedback, TTL and syllable-code outputs |
+| **2. Single box + closed loop** | Live, Tune, Closed loop, MSN finder | as 1, plus spike-triggered closed loop, the MSN finder and the closed-loop pulse feedback (noise burst). Available if the build has the SpikeGLX SDK and/or the MSN finder; the screen says what is missing |
+| **3. Multi-box** | Live (all boxes), Tune | several boxes recording and giving feedback at once |
+
+Tick *Remember my choice* to skip the screen next time (stored in `feedbackplease_launch.txt`);
+**Switch mode...** in the toolbar comes back to it (acquisition must be stopped). Command line:
+`--mode single|closedloop|multi` picks a mode, `--choose` shows the screen anyway. Modes 1 and 2 use
+`feedbackplease.ini`, mode 3 uses `feedbackplease_multi.ini` (or the file named on the command line);
+either kind of file can be loaded in either mode.
+
+**The Tune tab has its own settings in every mode.** Changing them never affects a box, running or not.
+On the Tune tab the left panel shows the tuning set, with:
+
+- **Apply to box...**: copy what you tuned to one box (single box) or any boxes you tick (multi-box).
+  Choose which parts: detection (bands, gains, thresholds), syllables & target, song detector, feedback
+  timing. A box keeps its own hardware, recording, wave files and code-port settings. Applying to a
+  running box takes effect immediately.
+- **Load from box...**: start the tuning set from a box's current settings.
+
+Settings files hold the box(es) and the tuning set (`tune.*` keys); older files without a tuning set
+start tuning from their (first) box.
+
+### Multi-box
+
+The left panel has a **Box** selector with **+ Add** (a copy of the current box), **Remove**, **Name**
+and **Include in Start**; everything below it is that box's settings. The Live tab shows a table of every
+box (state, song/recording, onsets, target matches, feedback, current code, backlog, errors); click a row
+to see that box's plots and event log and edit its settings. **Start all / Stop all** run every included
+box; Test feedback and Reset counters act on the selected box. Each box records into its output folder
+with its name in the file names (`session_<time>_<box>_*`).
+
+Hardware: boxes are grouped by the NI card of their **AI channel** (a box with *Source = Simulated*
+plays its own synthetic song, so a rig can be tried without hardware). Each card gets one acquisition
+thread and:
+
+- one AI task with a channel per box (boxes on a card must use the same sample rate and frame size);
+- one DO task for all boxes' TTL lines, which must be on that card;
+- the syllable code port per box, on any card;
+- one **streaming AO** task for the boxes' speakers: each box needs its own AO channel on its card (a
+  PCIe-6321 has two). The stream is clocked by the card's AI sample clock and each box's stimulus is
+  mixed into its own channel, so boxes play independently and can overlap. The cost is a fixed output
+  latency equal to **AO stream buffer (ms)** (Hardware, default 5 ms). If the PC stalls longer than that, the
+  stream underflows; this is logged and the stream restarts. Wave files are resampled to the card's rate.
+  The closed-loop pulse burst is single-box only.
 
 ## Running
 
@@ -69,8 +120,9 @@ All writing happens on a background thread; the acquisition thread only queues d
 
 ## Tuning on recordings (Kernel Extraction equivalent)
 
-The **Tune on recordings** tab replaces LabVIEW's Kernel Extraction tab. The parameter panel on the left
-is shared with the Live tab, so whatever you tune is what runs live. Save it per bird with **Save as...**.
+The **Tune on recordings** tab replaces LabVIEW's Kernel Extraction tab. It has its own parameter set (see
+*Launch modes*): tune on recordings, then **Apply to box...**. The detection code is the same as live, so
+what you tune is what runs once applied.
 
 1. **Pick a folder** (Browse..., or type a path and press Enter). The pattern accepts `;`-separated
    wildcards, e.g. `*.wav;*.WAV`. Step through files with Prev / Next / Random, PageUp / PageDown, or
@@ -105,6 +157,17 @@ is shared with the Live tab, so whatever you tune is what runs live. Save it per
      and none in files with no song.
    - Threshold, syllable and feedback changes re-run every file instantly. Band, gain and song-detector
      changes need another *Analyze folder* (a warning appears).
+4. **Clean up recordings without song** (Folder summary). Useful after recording with low thresholds:
+   - A file passes if the tuning set's song detector stays on for at least **Keep files with song for at
+     least (s)** (default 0.5 s) in one stretch. Failing files are red in the file list and the table; the
+     table's *song s* column is each file's longest stretch of song.
+   - **Move N failing file(s) to 'rejected'...** moves them (after a confirmation with count and size) into
+     a `rejected` subfolder next to each file. Nothing is deleted, it works on network shares, and
+     `rejected` folders are skipped when scanning. The list updates without analyzing again.
+   - **Delete 'rejected' permanently...** deletes those folders after a second confirmation listing each
+     folder, the number of files and their size.
+   - The move is disabled while the analysis is running, if the song settings changed since it ran
+     (re-analyze first), or if the song detector is off.
 
 The offline analysis uses the same code as the real-time detector and is tested to produce bit-identical
 results, including the random feedback draws for a given seed.
@@ -175,6 +238,12 @@ the ▲▼ buttons.
   isn't known yet at its IOI end.
 - **+ Add syllable** copies the syllable being edited. Settings files from before syllables existed
   are converted on load: their target becomes a syllable called "target", which is selected.
+
+**Min gap (ms)** (Spectrum Selection, default 10 ms; 0 = the LabVIEW behaviour): gaps shorter than this are
+bridged, so a syllable, a tiny gap and another syllable count as one syllable: one onset, with IOI and SD
+measured across the gap. Onsets are never delayed. A drop below the end threshold only becomes an offset once
+the gap has lasted the minimum, so offset events and the syllable TTL line's falling edge come up to that much
+later; the offset time and SD still use the moment of the drop.
 
 Note that measured durations include the detector's lag: the envelope stays above the end threshold
 for up to one window (≤15 ms) after a syllable ends, so measured SDs run long and gaps run short,

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,6 +85,7 @@ public:
     void start(const std::vector<std::string>& files, const AppParams& p);
     void cancel();
     void clear();  // cancel and forget all results (e.g. a different folder was opened)
+    void removePaths(const std::set<std::string>& paths);  // forget files that were moved away
     // Changes whenever results are added or cleared; lets the GUI skip copying them.
     uint64_t version() const { return version_.load(); }
     bool running() const { return running_.load(); }
@@ -181,6 +183,21 @@ private:
     size_t batchDecCount_ = 0;
     double batchDecTime_ = -1.0;
     std::vector<double> scratchX_, scratchY_;
+
+    // ---- clean-up: files without song (Folder summary)
+    void updatePass();
+    void drawCleanup(const AppParams& p, bool stale);
+    void moveFailing();
+    void deleteRejected();
+    double keepSongSec_ = 0.5;       // a file passes if song stays on this long in one stretch
+    std::vector<double> longestSong_;  // per batch entry: longest stretch of song (s), -1 if unknown
+    std::vector<int8_t> pass_;         // per batch entry: 1 keep, 0 fails, -1 unknown (unreadable)
+    uint64_t passVersion_ = 0;
+    double passKeep_ = -1.0;
+    std::vector<std::string> rejectDirs_;  // 'rejected' folders under the open folder
+    std::string cleanupMsg_;
+    uintmax_t moveBytes_ = 0, delBytes_ = 0;  // shown in the confirmation dialogs
+    size_t delFiles_ = 0;
 };
 
 }  // namespace fp

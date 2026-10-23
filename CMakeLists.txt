@@ -40,7 +40,9 @@ target_include_directories(fp_core PUBLIC src)
 add_library(fp_engine STATIC
   src/io/SimBackend.cpp
   src/io/DaqBackend.cpp
-  src/app/Engine.cpp)
+  src/app/Box.cpp
+  src/app/Engine.cpp
+  src/io/DaqCard.cpp)
 target_link_libraries(fp_engine PUBLIC fp_core)
 
 if(FP_WITH_DAQMX)

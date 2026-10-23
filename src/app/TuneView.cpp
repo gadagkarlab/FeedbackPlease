@@ -254,6 +254,14 @@ void BatchAnalyzer::clear() {
     ++version_;
 }
 
+void BatchAnalyzer::removePaths(const std::set<std::string>& paths) {
+    std::lock_guard<std::mutex> lk(mx_);
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                  [&](const BatchEntry& e) { return paths.count(e.path) > 0; }),
+                   entries_.end());
+    ++version_;
+}
+
 void BatchAnalyzer::start(const std::vector<std::string>& files, const AppParams& p) {
     cancel();
     {
@@ -337,6 +345,13 @@ void TuneView::scanFolder() {
         scanError_ = "Not a folder: " + folder_;
         return;
     }
+    // 'rejected' folders hold files moved out by the clean-up: never list their contents,
+    // but remember them so they can be emptied.
+    rejectDirs_.clear();
+    auto isRejected = [](const fs::directory_entry& d) {
+        std::error_code e2;
+        return d.is_directory(e2) && d.path().filename() == "rejected";
+    };
     auto consider = [&](const fs::directory_entry& d) {
         std::error_code e2;
         if (d.is_regular_file(e2) && matchesAny(pattern_, d.path().filename().u8string()))
@@ -344,11 +359,21 @@ void TuneView::scanFolder() {
     };
     if (recursive_) {
         for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (isRejected(*it)) {
+                rejectDirs_.push_back(it->path().u8string());
+                it.disable_recursion_pending();
+                continue;
+            }
             consider(*it);
+        }
     } else {
-        for (auto it = fs::directory_iterator(root, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
-            consider(*it);
+        for (auto it = fs::directory_iterator(root, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (isRejected(*it))
+                rejectDirs_.push_back(it->path().u8string());
+            else
+                consider(*it);
+        }
     }
     if (ec) scanError_ = ec.message();
     std::sort(files_.begin(), files_.end());
@@ -549,6 +574,7 @@ void TuneView::draw(AppParams& p, int& editSyllable) {
         batch_.results(batchEntries_, batchEnvKey_, batchSongKey_);
     }
     if (!batchEntries_.empty()) updateBatchDecisions(p);  // keeps the per-file counts in the list current
+    updatePass();  // red = no song (clean-up in the Folder summary)
 
     ImGui::BeginChild("filelist", ImVec2(22.0f * em(), 0), ImGuiChildFlags_Border);
     if (files_.empty()) ImGui::TextDisabled(folder_.empty() ? "Choose a folder above." : "No matching files.");
@@ -571,7 +597,10 @@ void TuneView::draw(AppParams& p, int& editSyllable) {
                 const auto& s = batchSummary_[summaryIndex[i]];
                 label += "  [" + std::to_string(s.matches) + " match, " + std::to_string(s.fires) + " fb]";
             }
+            const bool fails = summaryIndex[i] >= 0 && size_t(summaryIndex[i]) < pass_.size() && pass_[size_t(summaryIndex[i])] == 0;
+            if (fails) ImGui::PushStyleColor(ImGuiCol_Text, kRed);
             if (ImGui::Selectable(label.c_str(), i == selected_)) select(i);
+            if (fails) ImGui::PopStyleColor();
             if (i == selected_ && ImGui::IsWindowAppearing()) ImGui::SetScrollHereY();
             ImGui::PopID();
         }
@@ -919,6 +948,187 @@ void TuneView::drawFileView(AppParams& p) {
     ImPlot::EndAlignedPlots();
 }
 
+// ---- clean-up: find and move away files without song
+
+namespace {
+// Files and bytes under a folder (for the confirmation dialogs).
+void folderSize(const std::string& dir, size_t& files, uintmax_t& bytes) {
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(fs::u8path(dir), fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        std::error_code e2;
+        if (it->is_regular_file(e2)) {
+            ++files;
+            bytes += it->file_size(e2);
+        }
+    }
+}
+
+std::string sizeText(uintmax_t bytes) {
+    char buf[32];
+    if (bytes >= (uintmax_t(1) << 30))
+        std::snprintf(buf, sizeof buf, "%.2f GB", double(bytes) / double(uintmax_t(1) << 30));
+    else
+        std::snprintf(buf, sizeof buf, "%.1f MB", double(bytes) / double(uintmax_t(1) << 20));
+    return buf;
+}
+}  // namespace
+
+// Per analyzed file: the longest stretch with the song detector on, and whether that
+// reaches keepSongSec_. Uses the song track from 'Analyze folder' (current song settings
+// at the time of the analysis).
+void TuneView::updatePass() {
+    if (passVersion_ == batchVersion_ && passKeep_ == keepSongSec_ && pass_.size() == batchEntries_.size()) return;
+    passVersion_ = batchVersion_;
+    passKeep_ = keepSongSec_;
+    longestSong_.assign(batchEntries_.size(), -1.0);
+    pass_.assign(batchEntries_.size(), -1);
+    for (size_t i = 0; i < batchEntries_.size(); ++i) {
+        const auto& e = batchEntries_[i];
+        if (!e.error.empty() || !e.song || !e.env) continue;
+        size_t run = 0, best = 0;
+        for (uint8_t a : e.song->active) {
+            run = a ? run + 1 : 0;
+            best = std::max(best, run);
+        }
+        longestSong_[i] = double(best) * e.env->frameMs() / 1000.0;
+        pass_[i] = longestSong_[i] >= keepSongSec_ ? 1 : 0;
+    }
+}
+
+void TuneView::drawCleanup(const AppParams& p, bool stale) {
+    size_t failing = 0, known = 0;
+    for (size_t i = 0; i < pass_.size(); ++i) {
+        if (pass_[i] < 0) continue;
+        ++known;
+        if (pass_[i] == 0) ++failing;
+    }
+    ImGui::SeparatorText("Clean up: files without song");
+    ImGui::SetNextItemWidth(4.0f * em());
+    ImGui::InputDouble("Keep files with song for at least (s)", &keepSongSec_, 0, 0, "%.3g");
+    keepSongSec_ = std::clamp(keepSongSec_, 0.0, 600.0);
+    HelpMarker("A file passes if the song detector (Song Detection settings of the tuning set) stays on for at least "
+               "this long in one stretch. Failing files are shown in red in the file list and the table below. Tune "
+               "the song detector and detection settings until only song passes, then move the rest away.");
+    ImGui::SameLine();
+    ImGui::TextColored(failing ? kRed : kGreen, "%zu of %zu file(s) fail", failing, known);
+
+    const bool songOff = !p.song.enabled;
+    const bool busy = batch_.running();
+    const bool canMove = failing > 0 && !stale && !busy && !songOff;
+    ImGui::BeginDisabled(!canMove);
+    char label[96];
+    std::snprintf(label, sizeof label, "Move %zu failing file(s) to 'rejected'...", failing);
+    if (ImGui::Button(label)) {
+        moveBytes_ = 0;  // sizes once, not every frame (slow on network shares)
+        for (size_t i = 0; i < pass_.size(); ++i) {
+            std::error_code ec;
+            if (pass_[i] == 0) moveBytes_ += fs::file_size(fs::u8path(batchEntries_[i].path), ec);
+        }
+        ImGui::OpenPopup("Move failing files###confirmmove");
+    }
+    ImGui::EndDisabled();
+    if (!canMove && failing > 0 && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", songOff ? "The song detector is off in the tuning set."
+                                : busy  ? "Wait for the analysis to finish."
+                                        : "Settings changed since the analysis: press 'Analyze folder' again first.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(rejectDirs_.empty() || busy);
+    if (ImGui::Button("Delete 'rejected' permanently...")) {
+        delFiles_ = 0;
+        delBytes_ = 0;
+        for (const auto& d : rejectDirs_) folderSize(d, delFiles_, delBytes_);
+        ImGui::OpenPopup("Delete rejected files###confirmdelete");
+    }
+    ImGui::EndDisabled();
+    if (!cleanupMsg_.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(kAmber, "%s", cleanupMsg_.c_str());
+    }
+
+    if (ImGui::BeginPopupModal("Move failing files###confirmmove", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Move %zu file(s) (%s) without at least %.3g s of song into a 'rejected' subfolder next to them?",
+                    failing, sizeText(moveBytes_).c_str(), keepSongSec_);
+        ImGui::TextDisabled("Nothing is deleted: you can move them back, or check them and then use 'Delete "
+                            "'rejected' permanently'.");
+        if (ImGui::Button("Move")) {
+            moveFailing();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopupModal("Delete rejected files###confirmdelete", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(kRed, "Permanently delete %zu file(s) (%s)? This cannot be undone.", delFiles_,
+                           sizeText(delBytes_).c_str());
+        for (const auto& d : rejectDirs_) ImGui::BulletText("%s", d.c_str());
+        if (ImGui::Button("Delete permanently")) {
+            deleteRejected();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+
+void TuneView::moveFailing() {
+    std::set<std::string> moved;
+    size_t errors = 0;
+    std::string firstError;
+    for (size_t i = 0; i < pass_.size() && i < batchEntries_.size(); ++i) {
+        if (pass_[i] != 0) continue;
+        const fs::path src = fs::u8path(batchEntries_[i].path);
+        const fs::path dir = src.parent_path() / "rejected";
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        // Never overwrite: add _1, _2, ... if a file of that name was rejected before.
+        fs::path dst = dir / src.filename();
+        for (int k = 1; fs::exists(dst, ec); ++k)
+            dst = dir / fs::u8path(src.stem().u8string() + "_" + std::to_string(k) + src.extension().u8string());
+        fs::rename(src, dst, ec);
+        if (ec) {
+            if (!errors++) firstError = src.filename().u8string() + ": " + ec.message();
+            continue;
+        }
+        moved.insert(batchEntries_[i].path);
+        const std::string d = dir.u8string();
+        if (std::find(rejectDirs_.begin(), rejectDirs_.end(), d) == rejectDirs_.end()) rejectDirs_.push_back(d);
+    }
+    // Drop the moved files from the list and the results; no need to analyze again.
+    const std::string selPath = selected_ >= 0 && selected_ < int(files_.size()) ? files_[size_t(selected_)] : "";
+    files_.erase(std::remove_if(files_.begin(), files_.end(), [&](const std::string& f) { return moved.count(f) > 0; }),
+                 files_.end());
+    batch_.removePaths(moved);
+    const auto it = std::find(files_.begin(), files_.end(), selPath);
+    selected_ = files_.empty() ? -1 : it != files_.end() ? int(it - files_.begin()) : 0;
+    reqPath_.clear();
+    cleanupMsg_ = "Moved " + std::to_string(moved.size()) + " file(s) to 'rejected'" +
+                  (errors ? "; " + std::to_string(errors) + " failed (" + firstError + ")" : "");
+}
+
+void TuneView::deleteRejected() {
+    size_t files = 0;
+    std::string firstError;
+    std::vector<std::string> kept;
+    for (const auto& d : rejectDirs_) {
+        size_t n = 0;
+        uintmax_t b = 0;
+        folderSize(d, n, b);
+        std::error_code ec;
+        fs::remove_all(fs::u8path(d), ec);
+        if (ec) {
+            if (firstError.empty()) firstError = d + ": " + ec.message();
+            kept.push_back(d);
+        } else {
+            files += n;
+        }
+    }
+    rejectDirs_ = kept;
+    cleanupMsg_ = "Deleted " + std::to_string(files) + " file(s)" + (firstError.empty() ? "" : "; " + firstError);
+}
+
 void TuneView::drawFolderSummary(AppParams& p) {
     // ---- run / progress
     if (batch_.running()) {
@@ -970,6 +1180,7 @@ void TuneView::drawFolderSummary(AppParams& p) {
                 files, seconds / 60.0, syl, tgt ? tgt->name.c_str() : "none", matches, withMatch,
                 files ? 100.0 * withMatch / files : 0.0, blocked, fires,
                 errors ? "  |  some files could not be read" : "");
+    drawCleanup(p, batchSongKey_ != songKey(p));
 
     // ---- choose the syllable being edited (counts = first matches across the folder)
     auto& list = p.codes.list;
@@ -1161,13 +1372,13 @@ void TuneView::drawFolderSummary(AppParams& p) {
                         e.name.c_str(), minMax ? "min / max" : "the setpoint (thick) or +/- eps (thin)");
 
     // ---- per-file table
-    if (ImGui::BeginTable("batchfiles", 7,
+    if (ImGui::BeginTable("batchfiles", 8,
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                               ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("file", ImGuiTableColumnFlags_WidthStretch);
         const std::string editedCol = "'" + e.name + "'";
-        for (const char* c : {"sec", "syllables", editedCol.c_str(), "target", "blocked", "feedback"})
+        for (const char* c : {"sec", "song s", "syllables", editedCol.c_str(), "target", "blocked", "feedback"})
             ImGui::TableSetupColumn(c, ImGuiTableColumnFlags_WidthFixed, 5.5f * em());
         ImGui::TableHeadersRow();
         ImGuiListClipper clip;
@@ -1179,6 +1390,8 @@ void TuneView::drawFolderSummary(AppParams& p) {
                 ImGui::TableNextColumn();
                 ImGui::PushID(i);
                 const bool sel = selected_ >= 0 && selected_ < int(files_.size()) && files_[selected_] == e.path;
+                const bool fails = size_t(i) < pass_.size() && pass_[size_t(i)] == 0;
+                if (fails) ImGui::PushStyleColor(ImGuiCol_Text, kRed);
                 if (ImGui::Selectable(fileName(e.path).c_str(), sel, ImGuiSelectableFlags_SpanAllColumns)) {
                     const auto it = std::find(files_.begin(), files_.end(), e.path);
                     if (it != files_.end()) {
@@ -1186,6 +1399,7 @@ void TuneView::drawFolderSummary(AppParams& p) {
                         openFileTab_ = true;
                     }
                 }
+                if (fails) ImGui::PopStyleColor();
                 ImGui::PopID();
                 if (!e.error.empty()) {
                     ImGui::TableNextColumn();
@@ -1195,6 +1409,9 @@ void TuneView::drawFolderSummary(AppParams& p) {
                 const FileSummary s = i < int(batchSummary_.size()) ? batchSummary_[i] : FileSummary{};
                 ImGui::TableNextColumn();
                 ImGui::Text("%.1f", e.durationSec);
+                ImGui::TableNextColumn();
+                const double song = size_t(i) < longestSong_.size() ? longestSong_[size_t(i)] : -1.0;
+                if (song >= 0) ImGui::TextColored(fails ? kRed : kGreen, "%.2f", song);
                 ImGui::TableNextColumn();
                 ImGui::Text("%zu", s.syllables);
                 ImGui::TableNextColumn();

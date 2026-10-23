@@ -4,6 +4,8 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,7 @@ struct HardwareParams {
     double aiMax = 10.0;
     double sampleRate = 40000.0;
     int samplesPerFrame = 40;     // 40 samples @ 40 kHz = 1 ms detection update
+    double aoStreamMs = 5.0;      // multi-box: AO stream buffer = feedback output latency (ms)
     double inputBufferSec = 2.0;  // DAQmx host buffer; only matters if we fall behind
 
     std::string aoChannel = "Dev1/ao0";  // feedback waveform output; empty = no AO
@@ -85,6 +88,7 @@ struct SpectrumParams {
     BandCombination combination = BandCombination::Difference;
     double sylStartThresh = 0.069296;
     double sylEndThresh = 0.0274191;
+    double minGapMs = 10.0;  // gaps shorter than this are bridged: the syllables on both sides count as one
 };
 
 // "Processing Params" cluster.
@@ -221,6 +225,8 @@ struct RecordingParams {
 };
 
 struct AppParams {
+    std::string boxName = "Box 1";  // used in the multi-box view and in recording file names
+    bool boxEnabled = true;         // multi-box: included when "Start all" is pressed
     HardwareParams hw;
     SourceParams source;
     SpectrumParams spectrum;
@@ -237,6 +243,14 @@ struct AppParams {
 // their current values, so old settings files keep loading after fields are added.
 bool loadParams(const std::string& path, AppParams& p, std::string* err = nullptr);
 bool saveParams(const std::string& path, const AppParams& p, std::string* err = nullptr);
+
+// Several parameter sets in one file, distinguished by a key prefix ("tune.", "box2.").
+// readParams returns an error description, empty on success.
+using ParamMap = std::map<std::string, std::string>;
+bool readParamFile(const std::string& path, ParamMap& kv, std::string* err = nullptr);
+bool hasSection(const ParamMap& kv, const std::string& prefix);
+std::string readParams(const ParamMap& kv, AppParams& p, const std::string& prefix = "");
+void writeParams(std::ostream& os, const AppParams& p, const std::string& prefix = "");
 
 const char* toString(BandCombination c);
 const char* toString(TriggerType t);

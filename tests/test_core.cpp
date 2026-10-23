@@ -83,6 +83,38 @@ static void testSegmenterAndMatcher() {
     CHECK(std::fabs(m.prevIoi() - 95) < 1e-9);
     CHECK(std::fabs(m.sd() - 95) < 1e-9);
 
+    // Minimum gap (10 ms): a 6 ms gap is bridged, a real gap ends the syllable at the drop.
+    {
+        SyllableSegmenter g;
+        int onsets = 0, offsets = 0;
+        SegmenterOutput last;
+        auto step = [&](double v, double t) {
+            last = g.update(v, t, 0.5, 0.2, 10.0);
+            onsets += last.onset;
+            offsets += last.offset;
+            return last;
+        };
+        step(1.0, 0);                            // onset
+        CHECK(!step(0.1, 50).offset);            // drop: maybe a gap
+        CHECK(step(0.1, 50).inSyllable);         // still one syllable during the possible gap
+        CHECK(!step(1.0, 56).onset);             // back after 6 ms: bridged, no new onset
+        CHECK(!step(0.1, 120).offset);           // real end at 120 ...
+        CHECK(!step(0.1, 125).offset);
+        const auto off = step(0.1, 130);         // ... confirmed 10 ms later
+        CHECK(off.offset && off.offsetMs == 120 && off.sdMs == 120 && !off.inSyllable);
+        const auto on2 = step(1.0, 200);
+        CHECK(on2.onset && on2.newIOI && on2.ioiMs == 200);  // IOI across the bridged gap
+        step(0.1, 250);                          // drop ...
+        CHECK(step(0.1, 260).offset);            // ... a gap of exactly 10 ms is real
+        CHECK(step(1.0, 261).onset);
+        CHECK(onsets == 3 && offsets == 2);
+
+        SyllableSegmenter z;  // min gap 0 = the old behaviour: the drop is the offset
+        z.update(1.0, 0, 0.5, 0.2, 0.0);
+        const auto o = z.update(0.1, 50, 0.5, 0.2, 0.0);
+        CHECK(o.offset && o.offsetMs == 50 && o.sdMs == 50);
+    }
+
     // Hysteresis: dipping between the thresholds does not end a syllable.
     SyllableSegmenter s2;
     CHECK(s2.update(1.0, 0, 0.5, 0.2).onset);
@@ -551,6 +583,43 @@ static void testNoiseBurst() {
     CHECK(w.size() == nDelay + 3 && w[nDelay] == 0.5 && w[nDelay + 1] == -1.0 && w[nDelay + 2] == 2.0 && w[0] == 0.0);
 }
 
+static void testParamSections() {
+    // A multi-box settings file: two boxes and a tuning set, each under its own prefix.
+    AppParams a, b, t;
+    a.boxName = "Zebra A";
+    a.hw.aiChannel = "Dev2/ai0";
+    b.boxName = "Zebra B";
+    b.hw.aiChannel = "Dev2/ai1";
+    b.boxEnabled = false;
+    b.spectrum.sylStartThresh = 0.5;
+    t.spectrum.sylStartThresh = 0.123;
+    t.codes.target = -1;
+    {
+        std::ofstream out("fp_sections.ini");
+        out << "boxes.count = 2\n";
+        writeParams(out, a, "box1.");
+        writeParams(out, b, "box2.");
+        writeParams(out, t, "tune.");
+    }
+    ParamMap kv;
+    CHECK(readParamFile("fp_sections.ini", kv));
+    CHECK(hasSection(kv, "box2.") && hasSection(kv, "tune.") && !hasSection(kv, "box3.") && !hasSection(kv, "hw."));
+    AppParams a2, b2, t2;
+    CHECK(readParams(kv, a2, "box1.").empty());
+    CHECK(readParams(kv, b2, "box2.").empty());
+    CHECK(readParams(kv, t2, "tune.").empty());
+    CHECK(a2.boxName == "Zebra A" && a2.hw.aiChannel == "Dev2/ai0" && a2.boxEnabled);
+    CHECK(b2.boxName == "Zebra B" && b2.hw.aiChannel == "Dev2/ai1" && !b2.boxEnabled && b2.spectrum.sylStartThresh == 0.5);
+    CHECK(t2.spectrum.sylStartThresh == 0.123 && t2.codes.target == -1);
+    std::remove("fp_sections.ini");
+
+    // A single-box file still loads unprefixed, as before.
+    CHECK(saveParams("fp_single.ini", a));
+    AppParams s;
+    CHECK(loadParams("fp_single.ini", s) && s.boxName == "Zebra A");
+    std::remove("fp_single.ini");
+}
+
 static void testParamsRoundTrip() {
     AppParams a;
     a.hw.aiChannel = "PXI1Slot2/ai3";
@@ -590,6 +659,8 @@ static void testParamsRoundTrip() {
     std::remove("fp_test_params.ini");
 }
 
+
+
 int main() {
     std::printf("BandEnvelope\n");
     testBandEnvelopeSine();
@@ -617,6 +688,8 @@ int main() {
     testSyllableCodesOnSong();
     std::printf("Song-triggered files\n");
     testSongFiles();
+    std::printf("Settings sections (multi-box files)\n");
+    testParamSections();
     std::printf("Params round trip\n");
     testParamsRoundTrip();
     if (g_failures) {

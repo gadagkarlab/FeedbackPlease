@@ -72,7 +72,7 @@ FrameResult Detector::decide(uint64_t sampleEnd, double value, const SongState& 
     r.value = value;
     r.displayValue = toDisplay(value, p_.proc.displayDb);
 
-    r.seg = seg_.update(value, r.tMs, p_.spectrum.sylStartThresh, p_.spectrum.sylEndThresh);
+    r.seg = seg_.update(value, r.tMs, p_.spectrum.sylStartThresh, p_.spectrum.sylEndThresh, p_.spectrum.minGapMs);
     r.sylCode = classifier_.update(r.seg, p_.codes);
     // The target is just one of the syllables: it matches when it is the first match.
     r.match.evaluated = r.sylCode.evaluated;

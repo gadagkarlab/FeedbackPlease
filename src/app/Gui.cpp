@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 
 #include "app/Widgets.h"
 #include "core/NoiseBurst.h"
@@ -27,50 +28,160 @@ ImVec4 stateColor(FbState s) {
     }
 }
 
+const ImVec4 kDim(0.6f, 0.6f, 0.6f, 1.0f);
+
 }  // namespace
 
-Gui::Gui(std::string settingsPath) : settingsPath_(std::move(settingsPath)) {
-    if (std::filesystem::exists(settingsPath_)) {
+const char* toString(AppMode m) {
+    switch (m) {
+        case AppMode::Single: return "Single box";
+        case AppMode::ClosedLoop: return "Single box + closed loop";
+        case AppMode::Multi: return "Multi-box";
+    }
+    return "?";
+}
+
+const char* modeKey(AppMode m) {
+    switch (m) {
+        case AppMode::Single: return "single";
+        case AppMode::ClosedLoop: return "closedloop";
+        case AppMode::Multi: return "multi";
+    }
+    return "single";
+}
+
+Gui::Gui(std::string settingsPath, AppMode mode) : settingsPath_(std::move(settingsPath)), mode_(mode) {
+    boxes_.resize(1);
+    tuneP_ = boxes_[0];
+    if (std::filesystem::exists(std::filesystem::u8path(settingsPath_))) {
         std::string err;
-        if (loadParams(settingsPath_, p_, &err))
+        if (loadSettings(settingsPath_, &err))
             status_ = "Loaded " + settingsPath_;
         else
             status_ = "Settings: " + err;
     }
-    if (!daqAvailable()) p_.source.kind = SourceKind::Simulated;
+    if (!daqAvailable())
+        for (auto& b : boxes_) b.source.kind = SourceKind::Simulated;
 #ifdef FP_CLOSEDLOOP
-    std::string clStatus;
-    closed_.load(closedLoopPath(), &clStatus);
-    if (status_.empty()) status_ = clStatus;
+    if (mode_ == AppMode::ClosedLoop) {
+        std::string clStatus;
+        closed_.load(closedLoopPath(), &clStatus);
+        if (status_.empty()) status_ = clStatus;
+    }
 #endif
 #ifdef FP_MSN
-    msn_.load(msnPath(), nullptr);
+    if (mode_ == AppMode::ClosedLoop) msn_.load(msnPath(), nullptr);
 #endif
 }
 
 Gui::~Gui() {
     engine_.stop();
 #ifdef FP_CLOSEDLOOP
-    closed_.shutdown();
-    closed_.save(closedLoopPath());
+    if (mode_ == AppMode::ClosedLoop) {
+        closed_.shutdown();
+        closed_.save(closedLoopPath());
+    }
 #endif
 #ifdef FP_MSN
-    msn_.shutdown();
-    msn_.save(msnPath());
+    if (mode_ == AppMode::ClosedLoop) {
+        msn_.shutdown();
+        msn_.save(msnPath());
+    }
 #endif
-    saveParams(settingsPath_, p_);
+    saveSettings(settingsPath_, nullptr);
+}
+
+// ---- settings files
+// Single-box modes: the box's keys unprefixed (as before) + the tuning set under "tune.".
+// Multi-box: "boxes.count", each box under "box1.", "box2.", ... + "tune.". Either kind
+// of file can be opened in either mode (a single-box file becomes box 1, a multi-box
+// file's box 1 becomes the single box).
+bool Gui::loadSettings(const std::string& path, std::string* err) {
+    ParamMap kv;
+    if (!readParamFile(path, kv, err)) return false;
+    std::string e;
+    std::vector<AppParams> boxes;
+    const bool multiFile = kv.count("boxes.count") > 0;
+    if (mode_ == AppMode::Multi && multiFile) {
+        int n = 1;
+        try {
+            n = std::clamp(std::stoi(kv["boxes.count"]), 1, 64);
+        } catch (...) {
+        }
+        boxes.resize(size_t(n));
+        for (int i = 0; i < n; ++i) {
+            boxes[size_t(i)].boxName = "Box " + std::to_string(i + 1);
+            e += readParams(kv, boxes[size_t(i)], "box" + std::to_string(i + 1) + ".");
+        }
+    } else {
+        boxes.resize(1);
+        e += readParams(kv, boxes[0], multiFile ? "box1." : "");
+    }
+    // A file without a tuning set (older files) starts tuning from its first box.
+    AppParams tune = boxes[0];
+    if (hasSection(kv, "tune.")) e += readParams(kv, tune, "tune.");
+    boxes_ = std::move(boxes);
+    tuneP_ = std::move(tune);
+    selBox_ = std::clamp(selBox_, 0, int(boxes_.size()) - 1);
+    if (err) *err = e;
+    return e.empty();
+}
+
+bool Gui::saveSettings(const std::string& path, std::string* err) {
+    std::ofstream out(std::filesystem::u8path(path));
+    if (!out) {
+        if (err) *err = "cannot write " + path;
+        return false;
+    }
+    out << "# FeedbackPlease settings (" << toString(mode_) << ")\n";
+    if (mode_ == AppMode::Multi) {
+        out << "boxes.count = " << boxes_.size() << "\n";
+        for (size_t i = 0; i < boxes_.size(); ++i) writeParams(out, boxes_[i], "box" + std::to_string(i + 1) + ".");
+    } else {
+        writeParams(out, boxes_[0]);
+    }
+    writeParams(out, tuneP_, "tune.");
+    return true;
+}
+
+// ---- engine
+
+Box* Gui::engineBox(int i) {
+    return i >= 0 && i < int(engineIdx_.size()) && engineIdx_[size_t(i)] >= 0 ? engine_.box(engineIdx_[size_t(i)])
+                                                                               : nullptr;
 }
 
 void Gui::startEngine() {
+    std::vector<AppParams> ps;
+    engineIdx_.assign(boxes_.size(), -1);
+    for (size_t i = 0; i < boxes_.size(); ++i) {
+        if (mode_ == AppMode::Multi && !boxes_[i].boxEnabled) continue;
+        AppParams p = boxes_[i];
+        if (mode_ != AppMode::ClosedLoop) p.pulse.enabled = false;  // the pulse input is a closed-loop feature
+        engineIdx_[i] = int(ps.size());
+        ps.push_back(p);
+    }
     std::string err;
-    if (engine_.start(p_, err))
-        status_ = "Running";
+    if (ps.empty())
+        status_ = "Start failed: no box is enabled";
+    else if (engine_.start(ps, mode_ != AppMode::Multi, err))
+        status_ = mode_ == AppMode::Multi ? "Running " + std::to_string(ps.size()) + " box(es)" : "Running";
     else
         status_ = "Start failed: " + err;
+    if (!engine_.running()) engineIdx_.assign(boxes_.size(), -1);
+}
+
+void Gui::pushBox(int i) {
+    if (Box* b = engineBox(i)) b->updateParams(boxes_[size_t(i)]);
+}
+
+void Gui::pushParams() {
+    if (tuning()) return;  // the tuning set never reaches a running box directly
+    pushBox(selBox_);
 }
 
 void Gui::openTune(const std::string& folder, bool analyze, bool summary) {
-    tune_.openFolder(folder, analyze || summary, p_, summary);
+    tune_.openFolder(folder, analyze || summary, tuneP_, summary);
     selectTuneTab_ = true;
 }
 
@@ -88,13 +199,34 @@ std::string Gui::msnPath() const {
 }
 #endif
 
-void Gui::pushParams() {
-    if (engine_.running()) engine_.updateParams(p_);
+// ---- tuning set <-> boxes
+
+void Gui::copyParts(const AppParams& from, AppParams& to, const CopyParts& c) {
+    if (c.detection) {
+        to.spectrum = from.spectrum;
+        to.proc = from.proc;
+    }
+    if (c.syllables) {
+        to.codes.list = from.codes.list;  // the box keeps its own code-port settings
+        to.codes.target = from.codes.target;
+    }
+    if (c.song) to.song = from.song;
+    if (c.feedback) {
+        const std::string w1 = to.fb.wave1, w2 = to.fb.wave2;  // stimulus files belong to the box
+        to.fb = from.fb;
+        to.fb.wave1 = w1;
+        to.fb.wave2 = w2;
+    }
 }
 
 void Gui::draw() {
     changed() = false;
-    stats_ = engine_.stats();  // one locked copy per frame
+    selBox_ = std::clamp(selBox_, 0, int(boxes_.size()) - 1);
+    pp_ = activeTab_ == 1 ? &tuneP_ : &boxes_[size_t(selBox_)];
+    const Box* box = engineBox(selBox_);
+    stats_ = box ? box->stats() : EngineStats{};
+    if (!engine_.running() && !engineIdx_.empty() && engine_.boxCount() == 0) engineIdx_.clear();
+
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
@@ -123,7 +255,11 @@ void Gui::draw() {
         changed() = beforeChanged;
     }
 #endif
-    else {
+    else if (activeTab_ == 1) {
+        drawTuneHeader();
+        drawControls();
+    } else {
+        if (mode_ == AppMode::Multi) drawBoxBar();
         drawControls();
     }
     ImGui::EndChild();
@@ -133,6 +269,7 @@ void Gui::draw() {
         int tab = activeTab_;
         if (ImGui::BeginTabItem("Live")) {
             tab = 0;
+            if (mode_ == AppMode::Multi) drawOverview();
             drawStatus();
             const float h = ImGui::GetContentRegionAvail().y;
             drawPlots(h * 0.80f);
@@ -141,11 +278,11 @@ void Gui::draw() {
         }
         if (ImGui::BeginTabItem("Tune on recordings", nullptr, selectTuneTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
             tab = 1;
-            tune_.draw(p_, editSyl_);
+            tune_.draw(tuneP_, editSyl_);
             ImGui::EndTabItem();
         }
 #ifdef FP_CLOSEDLOOP
-        {
+        if (mode_ == AppMode::ClosedLoop) {
             const std::string label =
                 std::string("Closed loop") + (closed_.state() == ClosedLoopRunner::State::Live ? " [live]" : "") + "###cltab";
             if (ImGui::BeginTabItem(label.c_str(), nullptr, selectClTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
@@ -159,12 +296,14 @@ void Gui::draw() {
         selectClTab_ = false;
 #endif
 #ifdef FP_MSN
-        if (ImGui::BeginTabItem("MSN finder", nullptr, selectMsnTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
-            tab = 3;
-            const bool before = changed();
-            msn_.drawMain();
-            changed() = before;
-            ImGui::EndTabItem();
+        if (mode_ == AppMode::ClosedLoop) {
+            if (ImGui::BeginTabItem("MSN finder", nullptr, selectMsnTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
+                tab = 3;
+                const bool before = changed();
+                msn_.drawMain();
+                changed() = before;
+                ImGui::EndTabItem();
+            }
         }
         selectMsnTab_ = false;
 #endif
@@ -186,7 +325,8 @@ void Gui::drawToolbar() {
     if (!running && !err.empty() && status_.rfind("Stopped", 0) != 0) status_ = "Stopped: " + err;
 
     ImGui::PushStyleColor(ImGuiCol_Button, running ? ImVec4(0.65f, 0.15f, 0.15f, 1) : ImVec4(0.15f, 0.5f, 0.2f, 1));
-    if (ImGui::Button(running ? "  Stop  " : "  Start  ", ImVec2(6 * em(), 0))) {
+    const char* startLabel = mode_ == AppMode::Multi ? (running ? " Stop all " : " Start all ") : (running ? "  Stop  " : "  Start  ");
+    if (ImGui::Button(startLabel, ImVec2(6.5f * em(), 0))) {
         if (running) {
             engine_.stop();
             status_ = "Stopped";
@@ -197,48 +337,57 @@ void Gui::drawToolbar() {
     ImGui::PopStyleColor();
 
     ImGui::SameLine();
-    ImGui::BeginDisabled(running);
-    EnumCombo("Source", &p_.source.kind, 2, 16.0f);
-    ImGui::EndDisabled();
+    ImGui::TextColored(kBlue, "%s", toString(mode_));
+    if (mode_ != AppMode::Multi) {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(running);
+        EnumCombo("Source", &boxes_[0].source.kind, 2, 14.0f);
+        ImGui::EndDisabled();
+    }
 
+    // Test buttons act on the selected box.
+    Box* box = engineBox(selBox_);
     ImGui::SameLine();
-    ImGui::BeginDisabled(!running);
-    if (ImGui::Button("Test feedback 1")) engine_.manualFire(1);
+    ImGui::BeginDisabled(!box);
+    if (ImGui::Button("Test feedback 1")) box->manualFire(1);
     ImGui::SameLine();
-    if (ImGui::Button("Test feedback 2")) engine_.manualFire(2);
+    if (ImGui::Button("Test feedback 2")) box->manualFire(2);
+    if (mode_ == AppMode::ClosedLoop) {
+        ImGui::SameLine();
+        if (ImGui::Button("Test pulse feedback")) box->manualFire(3);
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Test pulse feedback")) engine_.manualFire(3);
-    ImGui::SameLine();
-    if (ImGui::Button("Reset counters")) engine_.resetCounters();
+    if (ImGui::Button("Reset counters")) box->resetCounters();
     ImGui::EndDisabled();
+    if (mode_ == AppMode::Multi && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Test and reset act on the selected box: %s", boxes_[size_t(selBox_)].boxName.c_str());
 
-    // Settings files, e.g. one per bird. The file in use is saved again on exit.
+    // Settings files, e.g. one per bird (single box) or per rig (multi-box). The file in use is saved again on exit.
     const char* iniFilter = "Settings (*.ini)\0*.ini\0All files\0*.*\0";
+    auto saveSide = [&](std::string& e) {
+#ifdef FP_CLOSEDLOOP
+        if (mode_ == AppMode::ClosedLoop && !closed_.save(closedLoopPath(), &e)) status_ = e;
+#endif
+#ifdef FP_MSN
+        if (mode_ == AppMode::ClosedLoop && !msn_.save(msnPath(), &e)) status_ = e;
+#endif
+        (void)e;
+    };
     ImGui::SameLine();
     if (ImGui::Button("Save")) {
         std::string e;
-        status_ = saveParams(settingsPath_, p_, &e) ? "Saved " + settingsPath_ : e;
-#ifdef FP_CLOSEDLOOP
-        if (!closed_.save(closedLoopPath(), &e)) status_ = e;
-#endif
-#ifdef FP_MSN
-        if (!msn_.save(msnPath(), &e)) status_ = e;
-#endif
+        status_ = saveSettings(settingsPath_, &e) ? "Saved " + settingsPath_ : e;
+        saveSide(e);
     }
     ImGui::SameLine();
     if (ImGui::Button("Save as...")) {
         const std::string f = saveFileDialog(iniFilter, "ini");
         std::string e;
         if (!f.empty()) {
-            if (saveParams(f, p_, &e)) {
+            if (saveSettings(f, &e)) {
                 settingsPath_ = f;
                 status_ = "Saved " + f;
-#ifdef FP_CLOSEDLOOP
-                if (!closed_.save(closedLoopPath(), &e)) status_ = e;
-#endif
-#ifdef FP_MSN
-                if (!msn_.save(msnPath(), &e)) status_ = e;
-#endif
+                saveSide(e);
             } else {
                 status_ = e;
             }
@@ -249,29 +398,35 @@ void Gui::drawToolbar() {
     if (ImGui::Button("Load...")) {
         const std::string f = openFileDialog(iniFilter);
         if (!f.empty()) {
-            AppParams np = p_;
             std::string e;
-            if (loadParams(f, np, &e)) {
-                p_ = np;
+            if (loadSettings(f, &e)) {
                 settingsPath_ = f;
                 status_ = "Loaded " + f;
 #ifdef FP_CLOSEDLOOP
-                closed_.reset();
-                closed_.load(closedLoopPath(), &status_);
+                if (mode_ == AppMode::ClosedLoop) {
+                    closed_.reset();
+                    closed_.load(closedLoopPath(), &status_);
+                }
 #endif
 #ifdef FP_MSN
-                msn_.reset();
-                msn_.load(msnPath());
+                if (mode_ == AppMode::ClosedLoop) {
+                    msn_.reset();
+                    msn_.load(msnPath());
+                }
 #endif
             } else {
                 status_ = "Load failed: " + e;
             }
         }
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Switch mode...")) switchMode_ = true;
     ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Save these settings and go back to the launch screen (stop acquisition first).");
 
 #ifdef FP_CLOSEDLOOP
-    {
+    if (mode_ == AppMode::ClosedLoop) {
         const std::string cl = closed_.statusText();
         if (!cl.empty()) {
             ImGui::SameLine();
@@ -284,6 +439,163 @@ void Gui::drawToolbar() {
     ImGui::TextColored(bad ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "%s", status_.c_str());
 }
 
+// Multi-box: pick / add / remove / name the box shown in the panel below.
+void Gui::drawBoxBar() {
+    const bool running = engine_.running();
+    ImGui::SetNextItemWidth(12 * em());
+    if (ImGui::BeginCombo("Box", boxes_[size_t(selBox_)].boxName.c_str())) {
+        for (int i = 0; i < int(boxes_.size()); ++i) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(boxes_[size_t(i)].boxName.c_str(), i == selBox_)) selBox_ = i;
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::BeginDisabled(running);
+    ImGui::SameLine();
+    if (ImGui::Button("+ Add")) {
+        AppParams b = boxes_[size_t(selBox_)];  // a copy of the current box is the quickest start
+        b.boxName = "Box " + std::to_string(boxes_.size() + 1);
+        boxes_.push_back(b);
+        selBox_ = int(boxes_.size()) - 1;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Remove") && boxes_.size() > 1) {
+        boxes_.erase(boxes_.begin() + selBox_);
+        selBox_ = std::min(selBox_, int(boxes_.size()) - 1);
+    }
+    ImGui::EndDisabled();
+    AppParams& b = boxes_[size_t(selBox_)];
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(12 * em());
+    ImGui::InputText("Name", &b.boxName);
+    ImGui::SameLine();
+    ImGui::Checkbox("Include in Start", &b.boxEnabled);
+    ImGui::EndDisabled();
+    if (running) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Stop to add, remove or rename boxes. Detection settings apply live.");
+        ImGui::PopStyleColor();
+    }
+    ImGui::Separator();
+}
+
+// Multi-box Live tab: one row per box; click a row to show that box below.
+void Gui::drawOverview() {
+    const float rowH = ImGui::GetTextLineHeightWithSpacing();
+    const float h = std::min(ImGui::GetContentRegionAvail().y * 0.35f, rowH * float(boxes_.size() + 2));
+    if (!ImGui::BeginTable("boxes", 10,
+                           ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_ScrollY |
+                               ImGuiTableFlags_SizingStretchProp,
+                           ImVec2(0, h)))
+        return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    for (const char* c : {"box", "state", "mic", "song", "onsets", "target", "feedback", "code", "backlog", "error"})
+        ImGui::TableSetupColumn(c);
+    ImGui::TableHeadersRow();
+    for (int i = 0; i < int(boxes_.size()); ++i) {
+        const AppParams& p = boxes_[size_t(i)];
+        const Box* b = engineBox(i);
+        const EngineStats s = b ? b->stats() : EngineStats{};
+        const std::string e = b ? b->error() : std::string();
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::PushID(i);
+        if (ImGui::Selectable(p.boxName.c_str(), i == selBox_, ImGuiSelectableFlags_SpanAllColumns)) selBox_ = i;
+        ImGui::PopID();
+        ImGui::TableNextColumn();
+        if (!p.boxEnabled)
+            ImGui::TextColored(kDim, "excluded");
+        else if (s.running)
+            ImGui::TextColored(kGreen, "running");
+        else
+            ImGui::TextColored(kDim, "stopped");
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(p.source.kind == SourceKind::Daq ? p.hw.aiChannel.c_str() : "simulated");
+        ImGui::TableNextColumn();
+        ImGui::TextColored(s.songActive ? kBlue : kDim, "%s%s", s.songActive ? "SONG" : "-", s.songFileOpen ? " REC" : "");
+        ImGui::TableNextColumn();
+        ImGui::Text("%llu", (unsigned long long)s.onsets);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(s.matches ? kPurple : kDim, "%llu", (unsigned long long)s.matches);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(s.fires1 + s.fires2 ? kRed : kDim, "%llu", (unsigned long long)(s.fires1 + s.fires2));
+        ImGui::TableNextColumn();
+        ImGui::Text("%d", s.currentCode);
+        ImGui::TableNextColumn();
+        ImGui::Text("%.1f ms", s.backlogMs);
+        ImGui::TableNextColumn();
+        if (!e.empty()) ImGui::TextColored(kRed, "%s", e.c_str());
+    }
+    ImGui::EndTable();
+    ImGui::TextColored(kBlue, "%s", boxes_[size_t(selBox_)].boxName.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(selected; its settings are in the left panel)");
+}
+
+// Tune tab: the tuning set is separate from the boxes; copy it to / from them explicitly.
+void Gui::drawTuneHeader() {
+    ImGui::TextColored(kBlue, "Tuning parameters");
+    HelpMarker("These settings belong to the Tune tab only: changing them never affects a box, running or not. "
+               "Use 'Apply to box' to copy what you tuned to a box, and 'Load from box' to start from a box's "
+               "current settings.");
+    auto partsUi = [&](CopyParts& c) {
+        ImGui::Checkbox("Detection (bands, gains, thresholds)", &c.detection);
+        ImGui::Checkbox("Syllables & target", &c.syllables);
+        ImGui::Checkbox("Song detector", &c.song);
+        ImGui::Checkbox("Feedback timing (not the wave files)", &c.feedback);
+    };
+    if (ImGui::Button("Apply to box...")) ImGui::OpenPopup("applyto");
+    ImGui::SameLine();
+    if (ImGui::Button("Load from box...")) ImGui::OpenPopup("loadfrom");
+    if (ImGui::BeginPopup("applyto")) {
+        ImGui::TextUnformatted("Copy from the tuning set:");
+        partsUi(applyParts_);
+        ImGui::Separator();
+        if (applyTo_.size() != boxes_.size()) applyTo_.assign(boxes_.size(), mode_ != AppMode::Multi);
+        if (mode_ == AppMode::Multi) {
+            ImGui::TextUnformatted("To boxes:");
+            for (size_t i = 0; i < boxes_.size(); ++i) {
+                ImGui::PushID(int(i));
+                bool v = applyTo_[i];
+                if (ImGui::Checkbox(boxes_[i].boxName.c_str(), &v)) applyTo_[i] = v;
+                ImGui::PopID();
+            }
+        }
+        if (ImGui::Button("Apply")) {
+            int n = 0;
+            for (size_t i = 0; i < boxes_.size(); ++i) {
+                if (!applyTo_[i] && mode_ == AppMode::Multi) continue;
+                copyParts(tuneP_, boxes_[i], applyParts_);
+                pushBox(int(i));
+                ++n;
+            }
+            status_ = "Applied tuning to " + std::to_string(n) + " box(es)";
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopup("loadfrom")) {
+        ImGui::TextUnformatted("Replace in the tuning set:");
+        partsUi(loadParts_);
+        ImGui::Separator();
+        for (int i = 0; i < int(boxes_.size()); ++i) {
+            ImGui::PushID(i);
+            const std::string label = "From " + boxes_[size_t(i)].boxName;
+            if (ImGui::Button(label.c_str())) {
+                copyParts(boxes_[size_t(i)], tuneP_, loadParts_);
+                status_ = "Tuning set loaded from " + boxes_[size_t(i)].boxName;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::Separator();
+}
+
 void Gui::drawControls() {
     const ImGuiTreeNodeFlags open = ImGuiTreeNodeFlags_DefaultOpen;
     if (ImGui::CollapsingHeader("Syllables & Target", open)) {
@@ -294,7 +606,8 @@ void Gui::drawControls() {
     if (ImGui::CollapsingHeader("Processing Params")) drawProcessing();
     if (ImGui::CollapsingHeader("Song Detection (DetectBirdSong)")) drawSong();
     if (ImGui::CollapsingHeader("Feedback", open)) drawFeedback();
-    if (ImGui::CollapsingHeader("Closed-loop pulse feedback", open)) drawPulseFeedback();
+    if (tuning()) return;  // the rest is hardware and files, which the tuning set doesn't have
+    if (mode_ == AppMode::ClosedLoop && ImGui::CollapsingHeader("Closed-loop pulse feedback", open)) drawPulseFeedback();
     if (ImGui::CollapsingHeader("Hardware / Source")) drawHardware();
     if (ImGui::CollapsingHeader("Recording")) drawRecording();
     if (ImGui::CollapsingHeader("Display")) drawDisplay();
@@ -307,56 +620,71 @@ void Gui::drawHardware() {
     static const std::string devices = describeDaqDevices();  // queried once
     ImGui::TextWrapped("Devices: %s", devices.c_str());
     ImGui::BeginDisabled(running);
+    if (mode_ == AppMode::Multi) {
+        EnumCombo("Source", &P().source.kind, 2, 14.0f);
+        HelpMarker("Simulated boxes each play their own song; NI-DAQmx boxes are grouped by the card of their AI "
+                   "channel. Boxes on one card share its AI task (same sample rate and frame size), one DO task (their "
+                   "TTL lines must be on that card) and one streaming AO task (each box its own AO channel on that "
+                   "card). The syllable code port can be on any card.");
+    }
 
     ImGui::SeparatorText("Analog input (microphone)");
-    InputStr("AI channel", &p_.hw.aiChannel, 10);
-    EnumCombo("Terminal config", &p_.hw.terminalConfig, 5, 10);
-    InputD("Min (V)", &p_.hw.aiMin, "%.3g", 4);
+    InputStr("AI channel", &P().hw.aiChannel, 10);
+    EnumCombo("Terminal config", &P().hw.terminalConfig, 5, 10);
+    InputD("Min (V)", &P().hw.aiMin, "%.3g", 4);
     ImGui::SameLine();
-    InputD("Max (V)", &p_.hw.aiMax, "%.3g", 4);
-    InputD("Sample rate (Hz)", &p_.hw.sampleRate, "%.0f");
-    InputI("Samples per frame", &p_.hw.samplesPerFrame);
-    p_.hw.samplesPerFrame = std::max(1, p_.hw.samplesPerFrame);
+    InputD("Max (V)", &P().hw.aiMax, "%.3g", 4);
+    InputD("Sample rate (Hz)", &P().hw.sampleRate, "%.0f");
+    InputI("Samples per frame", &P().hw.samplesPerFrame);
+    P().hw.samplesPerFrame = std::max(1, P().hw.samplesPerFrame);
     ImGui::SameLine();
-    ImGui::TextDisabled("= %.2f ms", p_.hw.samplesPerFrame * 1000.0 / std::max(1.0, p_.hw.sampleRate));
-    InputD("Input buffer (s)", &p_.hw.inputBufferSec, "%.2g");
+    ImGui::TextDisabled("= %.2f ms", P().hw.samplesPerFrame * 1000.0 / std::max(1.0, P().hw.sampleRate));
+    InputD("Input buffer (s)", &P().hw.inputBufferSec, "%.2g");
 
     ImGui::SeparatorText("Analog output (feedback waveform)");
-    InputStr("AO channel", &p_.hw.aoChannel, 10);
+    InputStr("AO channel", &P().hw.aoChannel, 10);
     HelpMarker("Plays Feedback 1/2 wave files. Leave empty to disable. The AO rate is the wave file's sample rate.");
-    InputD("AO min (V)", &p_.hw.aoMin, "%.3g", 4);
+    InputD("AO min (V)", &P().hw.aoMin, "%.3g", 4);
     ImGui::SameLine();
-    InputD("AO max (V)", &p_.hw.aoMax, "%.3g", 4);
-    InputD("Volts at full scale", &p_.hw.aoScale, "%.4g");
+    InputD("AO max (V)", &P().hw.aoMax, "%.3g", 4);
+    InputD("Volts at full scale", &P().hw.aoScale, "%.4g");
     HelpMarker("A wave sample of +1.0 is output as this many volts (clipped to the AO range).");
+    if (mode_ == AppMode::Multi) {
+        InputD("AO stream buffer (ms)", &P().hw.aoStreamMs, "%.3g", 4);
+        P().hw.aoStreamMs = std::clamp(P().hw.aoStreamMs, 2.0, 100.0);
+        HelpMarker("Multi-box plays each card's speakers from one continuous output stream so the boxes are "
+                   "independent. This much audio is queued ahead, so it is the feedback output latency; if the PC "
+                   "stalls longer than this, the stream underflows (logged, and it restarts). The first box on a card "
+                   "sets it. Wave files are resampled to the card's rate.");
+    }
 
     ImGui::SeparatorText("Digital outputs (TTL)");
-    InputStr("Feedback line", &p_.hw.doFeedbackLine, 12);
+    InputStr("Feedback line", &P().hw.doFeedbackLine, 12);
     HelpMarker("Pulses for 'TTL pulse' ms each time feedback is delivered. One line per field, e.g. Dev1/port0/line0. Empty = off.");
-    InputStr("Syllable line", &p_.hw.doSyllableLine, 12);
+    InputStr("Syllable line", &P().hw.doSyllableLine, 12);
     HelpMarker("High while a syllable is detected (start/end thresholds). Useful as a sync signal for the recording system.");
-    InputStr("Match line", &p_.hw.doMatchLine, 12);
+    InputStr("Match line", &P().hw.doMatchLine, 12);
     HelpMarker("Pulses when the target sequence matches, whether or not feedback follows (catch trials, refractory, no song).");
-    InputStr("Song line", &p_.hw.doSongLine, 12);
+    InputStr("Song line", &P().hw.doSongLine, 12);
     HelpMarker("High while the song detector says the bird is singing. Empty = off.");
-    InputStr("Syllable code port", &p_.hw.sylCodeOutput, 12);
+    InputStr("Syllable code port", &P().hw.sylCodeOutput, 12);
     HelpMarker("Where the matched syllable's U8 code is written. Either the name of a task saved in NI MAX "
                "(e.g. P2_SyllOut, like the LabVIEW VI) or a port / lines, e.g. Dev2/port1 or Dev2/port1/line0:7. "
                "Empty = off.");
 
     ImGui::SeparatorText("Simulated source");
-    PathInput("Song WAV", &p_.source.simWavPath);
+    PathInput("Song WAV", &P().source.simWavPath);
     HelpMarker("Played back in real time, looped. Leave empty for a built-in synthetic song that matches the default setpoints.");
-    InputD("Synthetic noise (V)", &p_.source.simNoiseVolts, "%.4g");
+    InputD("Synthetic noise (V)", &P().source.simNoiseVolts, "%.4g");
 
     ImGui::EndDisabled();
 }
 
 void Gui::drawSpectrum() {
-    InputD("# previous ms included in calcs", &p_.spectrum.windowMs, "%.3g");
-    p_.spectrum.windowMs = std::clamp(p_.spectrum.windowMs, 1.0, 200.0);
-    const double fs = stats_.running ? stats_.sampleRate : p_.hw.sampleRate;
-    const double n = std::round(p_.spectrum.windowMs * fs / 1000.0);
+    InputD("# previous ms included in calcs", &P().spectrum.windowMs, "%.3g");
+    P().spectrum.windowMs = std::clamp(P().spectrum.windowMs, 1.0, 200.0);
+    const double fs = stats_.running ? stats_.sampleRate : P().hw.sampleRate;
+    const double n = std::round(P().spectrum.windowMs * fs / 1000.0);
     ImGui::TextDisabled("%.0f samples, %.1f Hz bins", n, fs / std::max(1.0, n));
 
     auto bandTable = [&](const char* id, std::array<Band, kBandsPerGroup>& bands, const ImVec4& color) {
@@ -382,37 +710,44 @@ void Gui::drawSpectrum() {
     };
     ImGui::TextColored(kGreen, "Include bands");
     HelpMarker("Band RMS amplitudes are weighted by Gain and summed. Gain 0 disables a row.");
-    bandTable("include", p_.spectrum.include, kGreen);
+    bandTable("include", P().spectrum.include, kGreen);
     ImGui::TextColored(kRed, "Subtract bands");
     HelpMarker("Typically low-frequency / cage noise. Combined with the include sum using Band Combination F(x).");
-    bandTable("subtract", p_.spectrum.subtract, kRed);
+    bandTable("subtract", P().spectrum.subtract, kRed);
 
-    EnumCombo("Band Combination F(x)", &p_.spectrum.combination, 4, 8);
-    InputD("Syl Start Thresh", &p_.spectrum.sylStartThresh, "%.6g");
-    InputD("End Thresh", &p_.spectrum.sylEndThresh, "%.6g");
-    if (p_.spectrum.sylEndThresh > p_.spectrum.sylStartThresh)
+    EnumCombo("Band Combination F(x)", &P().spectrum.combination, 4, 8);
+    InputD("Syl Start Thresh", &P().spectrum.sylStartThresh, "%.6g");
+    InputD("End Thresh", &P().spectrum.sylEndThresh, "%.6g");
+    if (P().spectrum.sylEndThresh > P().spectrum.sylStartThresh)
         ImGui::TextColored(kAmber, "End threshold is above start threshold.");
+    InputD("Min gap (ms)", &P().spectrum.minGapMs, "%.3g");
+    P().spectrum.minGapMs = std::clamp(P().spectrum.minGapMs, 0.0, 500.0);
+    HelpMarker("Gaps shorter than this are bridged: a syllable, a tiny gap and another syllable count as one "
+               "syllable (one onset; IOI and SD measured across the gap). 0 = off (LabVIEW behaviour).\n"
+               "Onsets are not delayed. A syllable end is confirmed once the gap has lasted this long, so offset "
+               "events and the falling edge of the syllable TTL line come up to this much later; the offset time "
+               "and SD still use the moment the signal dropped.");
 }
 
 void Gui::drawProcessing() {
-    Check("Mean Subtract?", &p_.proc.meanSubtract);
-    Check("Software Gain?", &p_.proc.softwareGain);
+    Check("Mean Subtract?", &P().proc.meanSubtract);
+    Check("Software Gain?", &P().proc.softwareGain);
     ImGui::SameLine();
-    ImGui::BeginDisabled(!p_.proc.softwareGain);
-    InputD("Gain", &p_.proc.gain, "%.4g", 4);
+    ImGui::BeginDisabled(!P().proc.softwareGain);
+    InputD("Gain", &P().proc.gain, "%.4g", 4);
     ImGui::EndDisabled();
-    Check("Low Cutoff?", &p_.proc.lowCutoff);
+    Check("Low Cutoff?", &P().proc.lowCutoff);
     ImGui::SameLine();
-    ImGui::BeginDisabled(!p_.proc.lowCutoff);
-    InputD("Low Cutoff Threshold", &p_.proc.lowCutoffThresh, "%.3g", 5);
+    ImGui::BeginDisabled(!P().proc.lowCutoff);
+    InputD("Low Cutoff Threshold", &P().proc.lowCutoffThresh, "%.3g", 5);
     ImGui::EndDisabled();
     HelpMarker("Detection signal values below this are set to 0.");
-    Check("display dB?", &p_.proc.displayDb);
+    Check("display dB?", &P().proc.displayDb);
     HelpMarker("Display only. Thresholds always apply to the linear detection signal.");
 }
 
 void Gui::drawTarget() {
-    auto& c = p_.codes;
+    auto& c = P().codes;
     const SyllableCode* t = targetSyllable(c);
     const std::string current = t ? t->name + "  (code " + std::to_string(t->code) + ")" : "none (no feedback)";
     ImGui::SetNextItemWidth(14 * em());
@@ -438,7 +773,7 @@ void Gui::drawTarget() {
 }
 
 void Gui::drawFeedback() {
-    Check("Feedback enabled", &p_.fb.enabled);
+    Check("Feedback enabled", &P().fb.enabled);
     HelpMarker("When off, detection and the match TTL keep running but no feedback trials start.");
 
     if (ImGui::BeginTable("fb", 3, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV)) {
@@ -457,30 +792,32 @@ void Gui::drawFeedback() {
             InputD("##2", b, fmt, 6);
             ImGui::PopID();
         };
-        row("Probability", &p_.fb.prob1, &p_.fb.prob2, "%.3g");
-        row("Delay (ms)", &p_.fb.delay1Ms, &p_.fb.delay2Ms, "%.4g");
-        row("Detect Signal Thresh", &p_.fb.thresh1, &p_.fb.thresh2, "%.4g");
+        row("Probability", &P().fb.prob1, &P().fb.prob2, "%.3g");
+        row("Delay (ms)", &P().fb.delay1Ms, &P().fb.delay2Ms, "%.4g");
+        row("Detect Signal Thresh", &P().fb.thresh1, &P().fb.thresh2, "%.4g");
         ImGui::EndTable();
     }
     ImGui::TextDisabled("Delay 2 = -1 disables feedback 2.");
-    PathInput("Wave 1", &p_.fb.wave1, 15);
-    PathInput("Wave 2", &p_.fb.wave2, 15);
-    if (engine_.running()) ImGui::TextDisabled("Wave files are loaded at Start.");
-    EnumCombo("Feedback 2 mode", &p_.fb.mode2, 2, 12);
+    if (!tuning()) {  // stimulus files belong to a box, not to the tuning set
+        PathInput("Wave 1", &P().fb.wave1, 15);
+        PathInput("Wave 2", &P().fb.wave2, 15);
+        if (engine_.running()) ImGui::TextDisabled("Wave files are loaded at Start.");
+    }
+    EnumCombo("Feedback 2 mode", &P().fb.mode2, 2, 12);
     HelpMarker(
         "Alternative: each detection gives feedback 1 with Probability 1, else feedback 2 with Probability 2, "
         "else a catch trial.\nFollows feedback 1: after feedback 1 is sent, feedback 2 follows Delay 2 ms later "
         "with Probability 2.");
-    InputD("Refractory Period (ms)", &p_.fb.refractoryMs, "%.4g");
-    InputD("Feedback Delay (ms)", &p_.fb.extraDelayMs, "%.4g");
+    InputD("Refractory Period (ms)", &P().fb.refractoryMs, "%.4g");
+    InputD("Feedback Delay (ms)", &P().fb.extraDelayMs, "%.4g");
     HelpMarker("Added to Delay 1 (and to Delay 2 in Alternative mode).");
-    InputD("TTL pulse (ms)", &p_.fb.ttlPulseMs, "%.4g");
+    InputD("TTL pulse (ms)", &P().fb.ttlPulseMs, "%.4g");
 }
 
 // A digital pulse on an input line (raised by the closed loop when its spike count crosses threshold) plays a
 // bandpassed white-noise burst on the AO feedback channel: LabVIEW's "read the pulse, make white noise" loop.
 void Gui::drawPulseFeedback() {
-    auto& q = p_.pulse;
+    auto& q = P().pulse;
     const bool running = engine_.running();
     ImGui::TextWrapped("A rising edge on the input line plays a noise burst on the AO channel (Hardware / Source). "
                        "Wire the closed loop's digital output line to this input.");
@@ -523,13 +860,13 @@ void Gui::drawPulseFeedback() {
     InputD("Refractory (ms)", &q.refractoryMs, "%.4g", 6);
     q.refractoryMs = std::max(0.0, q.refractoryMs);
     HelpMarker("Pulses within this time of one that played are counted but ignored.");
-    if (q.enabled && p_.hw.aoChannel.empty()) ImGui::TextColored(kRed, "Set the AO channel under Hardware / Source.");
+    if (q.enabled && P().hw.aoChannel.empty()) ImGui::TextColored(kRed, "Set the AO channel under Hardware / Source.");
     if (q.enabled && q.diLine.empty()) ImGui::TextColored(kRed, "Set the pulse input line.");
     ImGui::EndDisabled();
 }
 
 void Gui::drawCodes() {
-    auto& c = p_.codes;
+    auto& c = P().codes;
     ImGui::SeparatorText("Syllables");
     HelpMarker(
         "Each syllable has a trigger type and a window for IOI, SD and previous IOI, as setpoint +/- eps or "
@@ -538,14 +875,16 @@ void Gui::drawCodes() {
         "code is written to the syllable code port and counted, and if it is the target, feedback is triggered.\n\n"
         "Click a syllable's header to edit it here and in the Tune tab's folder summary. In the Tune tab, "
         "Ctrl+click a syllable to set the edited syllable's windows from it, Ctrl+Shift+click to add a new one.");
-    Check("Write codes to port##codes", &c.enabled);
-    ImGui::SameLine();
-    EnumCombo("Hold", &c.hold, 3, 9);
-    if (c.hold == SylCodeHold::Pulse) {
+    if (!tuning()) {  // port output belongs to a box
+        Check("Write codes to port##codes", &c.enabled);
         ImGui::SameLine();
-        InputD("ms##codepulse", &c.pulseMs, "%.3g", 3);
+        EnumCombo("Hold", &c.hold, 3, 9);
+        if (c.hold == SylCodeHold::Pulse) {
+            ImGui::SameLine();
+            InputD("ms##codepulse", &c.pulseMs, "%.3g", 3);
+        }
     }
-    const auto& st = stats_;
+    const EngineStats st = tuning() ? EngineStats{} : stats_;  // live counts belong to the box too
     if (st.running) {
         ImGui::Text("Port now: %d", st.currentCode);
         ImGui::SameLine();
@@ -662,7 +1001,7 @@ void Gui::drawCodes() {
 }
 
 void Gui::drawSong() {
-    auto& s = p_.song;
+    auto& s = P().song;
     Check("Song detector enabled", &s.enabled);
     ImGui::SameLine();
     ImGui::BeginDisabled(!s.enabled);
@@ -716,7 +1055,7 @@ void Gui::drawSong() {
 }
 
 void Gui::drawRecording() {
-    auto& r = p_.rec;
+    auto& r = P().rec;
     const bool running = engine_.running();
     ImGui::BeginDisabled(running);  // all of this is applied at Start
     InputStr("##outdir", &r.outputDir, 12);
@@ -759,7 +1098,7 @@ void Gui::drawRecording() {
                "0.4 feedback (match and feedback last 'TTL pulse' ms). Every combination gives a distinct level.");
     if (r.songFiles && !r.chMic && !r.chDetection && !r.chMarkers)
         ImGui::TextColored(kAmber, "No channels selected: no song files will be written.");
-    if (r.songFiles && !p_.song.enabled)
+    if (r.songFiles && !P().song.enabled)
         ImGui::TextColored(kAmber, "The song detector is off, so no song files will be written.");
     ImGui::EndDisabled();
     ImGui::EndDisabled();
@@ -773,16 +1112,16 @@ void Gui::drawRecording() {
 }
 
 void Gui::drawDisplay() {
-    float w = float(p_.display.windowSec);
+    float w = float(P().display.windowSec);
     ImGui::SetNextItemWidth(12 * em());
-    if (ImGui::SliderFloat("Plot window (s)", &w, 0.2f, 10.0f, "%.1f")) p_.display.windowSec = w;
-    ImGui::Checkbox("Raw autoscale Y", &p_.display.rawAutoY);
-    if (!p_.display.rawAutoY) {
+    if (ImGui::SliderFloat("Plot window (s)", &w, 0.2f, 10.0f, "%.1f")) P().display.windowSec = w;
+    ImGui::Checkbox("Raw autoscale Y", &P().display.rawAutoY);
+    if (!P().display.rawAutoY) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(5 * em());
-        ImGui::InputDouble("+/- V", &p_.display.rawYRange, 0, 0, "%.3g");
+        ImGui::InputDouble("+/- V", &P().display.rawYRange, 0, 0, "%.3g");
     }
-    ImGui::Checkbox("Detection autoscale Y", &p_.display.envAutoY);
+    ImGui::Checkbox("Detection autoscale Y", &P().display.envAutoY);
 }
 
 void Gui::drawStatus() {
@@ -814,15 +1153,18 @@ void Gui::drawStatus() {
                 (unsigned long long)s.blocked, (unsigned long long)s.trials, (unsigned long long)s.fires1,
                 (unsigned long long)s.fires2, (unsigned long long)s.suppressed, (unsigned long long)s.catches,
                 (unsigned long long)s.songBouts);
-    if (p_.pulse.enabled) {
+    if (P().pulse.enabled) {
         ImGui::TextColored(s.pulseInput ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "closed-loop pulses in %llu  noise bursts played %llu%s",
                            (unsigned long long)s.pulseTrigs, (unsigned long long)s.pulseFires, s.pulseInput ? "   (input HIGH)" : "");
     }
 }
 
 void Gui::drawPlots(float height) {
-    engine_.snapshot(p_.display.windowSec, snap_);
-    const double win = p_.display.windowSec;
+    if (const Box* b = engineBox(selBox_))
+        b->snapshot(P().display.windowSec, snap_);
+    else
+        snap_ = ScopeSnapshot{};
+    const double win = P().display.windowSec;
     const float gap = ImGui::GetStyle().ItemSpacing.y;
     const float plotH = (height - 2 * gap) * 0.36f;
     const float songH = (height - 2 * gap) * 0.28f;
@@ -855,10 +1197,10 @@ void Gui::drawPlots(float height) {
 
     // ---- raw microphone voltage
     if (ImPlot::BeginPlot("Microphone", ImVec2(-1, plotH))) {
-        ImPlot::SetupAxes(nullptr, "V", 0, p_.display.rawAutoY ? ImPlotAxisFlags_AutoFit : 0);
+        ImPlot::SetupAxes(nullptr, "V", 0, P().display.rawAutoY ? ImPlotAxisFlags_AutoFit : 0);
         ImPlot::SetupAxisLimits(ImAxis_X1, -win, 0, ImPlotCond_Always);
-        if (!p_.display.rawAutoY)
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -p_.display.rawYRange, p_.display.rawYRange, ImPlotCond_Always);
+        if (!P().display.rawAutoY)
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -P().display.rawYRange, P().display.rawYRange, ImPlotCond_Always);
         ImPlot::SetupLegend(ImPlotLocation_NorthWest, ImPlotLegendFlags_Horizontal);
         const int buckets = std::max(100, int(ImPlot::GetPlotSize().x));
         const size_t nr = snap_.raw.size();
@@ -874,8 +1216,8 @@ void Gui::drawPlots(float height) {
 
     // ---- detection signal with thresholds and syllable shading
     if (ImPlot::BeginPlot("Detection signal", ImVec2(-1, plotH))) {
-        const bool dB = p_.proc.displayDb;
-        ImPlot::SetupAxes("time (s)", dB ? "dB" : "amplitude", 0, p_.display.envAutoY ? ImPlotAxisFlags_AutoFit : 0);
+        const bool dB = P().proc.displayDb;
+        ImPlot::SetupAxes("time (s)", dB ? "dB" : "amplitude", 0, P().display.envAutoY ? ImPlotAxisFlags_AutoFit : 0);
         ImPlot::SetupAxis(ImAxis_Y2, nullptr,
                           ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoTickMarks |
                               ImPlotAxisFlags_Lock);
@@ -902,8 +1244,8 @@ void Gui::drawPlots(float height) {
             ImPlot::SetNextLineStyle(kAmber, 1.5f);
             ImPlot::PlotLine("signal", xs_.data(), ys_.data(), int(m));
         }
-        const double th[2] = {Detector::toDisplay(p_.spectrum.sylStartThresh, dB),
-                              Detector::toDisplay(p_.spectrum.sylEndThresh, dB)};
+        const double th[2] = {Detector::toDisplay(P().spectrum.sylStartThresh, dB),
+                              Detector::toDisplay(P().spectrum.sylEndThresh, dB)};
         ImPlot::SetNextLineStyle(kGreen, 1.0f);
         ImPlot::PlotInfLines("start", &th[0], 1, ImPlotInfLinesFlags_Horizontal);
         ImPlot::SetNextLineStyle(kRed, 1.0f);
@@ -922,7 +1264,7 @@ void Gui::drawPlots(float height) {
         ImPlot::SetupLegend(ImPlotLocation_NorthWest, ImPlotLegendFlags_Horizontal);
 
         const size_t m = std::min({snap_.songFrac.size(), snap_.songRatio.size(), snap_.songOn.size()});
-        if (m > 0 && p_.song.enabled) {
+        if (m > 0 && P().song.enabled) {
             const auto x = frameTimes(m);
             std::vector<double> frac(m), ratio(m), on(m);
             for (size_t i = 0; i < m; ++i) {
@@ -934,14 +1276,14 @@ void Gui::drawPlots(float height) {
             ImPlot::PlotShaded("song", x.data(), on.data(), int(m), 0.0);
             ImPlot::SetNextLineStyle(kBlue, 1.5f);
             ImPlot::PlotLine("fraction", x.data(), frac.data(), int(m));
-            const double dth = p_.song.durationThresh;
+            const double dth = P().song.durationThresh;
             ImPlot::SetNextLineStyle(ImVec4(0.35f, 0.6f, 1.0f, 0.6f), 1.0f);
             ImPlot::PlotInfLines("duration thresh", &dth, 1, ImPlotInfLinesFlags_Horizontal);
 
             ImPlot::SetAxes(ImAxis_X1, ImAxis_Y2);
             ImPlot::SetNextLineStyle(ImVec4(0.8f, 0.8f, 0.8f, 0.7f), 1.0f);
             ImPlot::PlotLine("ratio", x.data(), ratio.data(), int(m));
-            const double rth = p_.song.ratioThresh;
+            const double rth = P().song.ratioThresh;
             ImPlot::SetNextLineStyle(ImVec4(0.8f, 0.8f, 0.8f, 0.5f), 1.0f);
             ImPlot::PlotInfLines("ratio thresh", &rth, 1, ImPlotInfLinesFlags_Horizontal);
             ImPlot::SetAxes(ImAxis_X1, ImAxis_Y1);
@@ -952,7 +1294,8 @@ void Gui::drawPlots(float height) {
 }
 
 void Gui::drawEventLog() {
-    const auto ev = engine_.events(300);
+    const Box* box = engineBox(selBox_);
+    const auto ev = box ? box->events(300) : std::vector<LogEvent>{};
     if (!ImGui::BeginTable("events", 3,
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                ImGuiTableFlags_SizingStretchProp))

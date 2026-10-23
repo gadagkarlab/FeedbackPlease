@@ -3,6 +3,40 @@
 This describes what happens while **Live** acquisition is running: which threads exist, what one
 1 ms frame does, and where each output is decided and written. File references point at the code.
 
+## Structure: boxes, frame sources, engine
+
+```
+ Engine (src/app/Engine.cpp)            owns the boxes and one acquisition thread per FrameSource
+  ├─ FrameSource (src/io/FrameSource.h) where frames come from, where each box's outputs go
+  │    ├─ SingleSource                  one box on its own backend (single-box modes, simulated boxes):
+  │    │                                DaqBackend = committed finite AO (sub-ms), pulse input, noise burst
+  │    └─ DaqCard (src/io/DaqCard.cpp)  multi-box: every box whose mic is on one NI card:
+  │                                     1 AI task (a channel per box), 1 DO task (all boxes' TTL lines),
+  │                                     a code-port task per box, 1 streaming AO task (a channel per box)
+  └─ Box (src/app/Box.cpp)              one box: Detector, decisions, outputs, counters, recorder,
+                                        plot buffers, event log, stats; process() runs one frame
+```
+
+Single-box modes run one Box on one SingleSource; multi-box groups DAQ boxes into one DaqCard per card
+(simulated boxes each get a SingleSource). Every Box runs the same `process()`, so detection and decisions
+are identical in every mode. The diagram and frame walk-through below show one box; on a DaqCard the thread
+reads one frame for all its boxes, runs `process()` for each, then writes the card's combined DO and AO
+once (`endFrame`).
+
+### Multi-box AO stream
+
+```
+ AI sample clock (/DevN/ai/SampleClock) ──clocks──► AO stream task (ao0 = box A, ao1 = box B)
+
+ every frame:  read n AI samples per box → each Box decides → fire? sets that box's playback cursor
+               → write n AO samples per channel (box's stimulus, or 0) → stream stays prefill frames ahead
+```
+
+The stream is primed with **AO stream buffer** ms of zeros and advances with the AI clock, so exactly one
+frame is written per frame read and the output latency stays at the prefill. A stall longer than the
+prefill underflows the stream: the error is logged on the card's boxes and the stream is re-primed and
+restarted (at most once a second).
+
 ## Threads
 
 ```mermaid

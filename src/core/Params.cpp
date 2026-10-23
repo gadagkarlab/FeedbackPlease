@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -16,7 +17,10 @@ namespace {
 // two can never drift apart.
 template <class F>
 void visitParams(AppParams& p, F&& f) {
+    f("box_name", p.boxName);
+    f("box_enabled", p.boxEnabled);
     f("hw.ai_channel", p.hw.aiChannel);
+    f("hw.ao_stream_ms", p.hw.aoStreamMs);
     f("hw.terminal_config", p.hw.terminalConfig);
     f("hw.ai_min", p.hw.aiMin);
     f("hw.ai_max", p.hw.aiMax);
@@ -49,6 +53,7 @@ void visitParams(AppParams& p, F&& f) {
     f("spectrum.combination", p.spectrum.combination);
     f("spectrum.syl_start_thresh", p.spectrum.sylStartThresh);
     f("spectrum.syl_end_thresh", p.spectrum.sylEndThresh);
+    f("spectrum.min_gap_ms", p.spectrum.minGapMs);
 
     f("proc.mean_subtract", p.proc.meanSubtract);
     f("proc.low_cutoff", p.proc.lowCutoff);
@@ -158,28 +163,30 @@ std::string trim(const std::string& s) {
 
 struct Saver {
     std::ostream& os;
-    void operator()(const std::string& k, std::string& v) { os << k << " = " << v << "\n"; }
+    std::string pre;  // key prefix, e.g. "box2." or "tune."
+    void operator()(const std::string& k, std::string& v) { os << pre << k << " = " << v << "\n"; }
     void operator()(const std::string& k, double& v) {
         char buf[64];
         std::snprintf(buf, sizeof buf, "%.10g", v);
-        os << k << " = " << buf << "\n";
+        os << pre << k << " = " << buf << "\n";
     }
-    void operator()(const std::string& k, int& v) { os << k << " = " << v << "\n"; }
-    void operator()(const std::string& k, bool& v) { os << k << " = " << (v ? 1 : 0) << "\n"; }
+    void operator()(const std::string& k, int& v) { os << pre << k << " = " << v << "\n"; }
+    void operator()(const std::string& k, bool& v) { os << pre << k << " = " << (v ? 1 : 0) << "\n"; }
     template <class E, std::enable_if_t<std::is_enum_v<E>, int> = 0>
     void operator()(const std::string& k, E& v) {
-        os << k << " = " << static_cast<int>(v) << "  # " << toString(v) << "\n";
+        os << pre << k << " = " << static_cast<int>(v) << "  # " << toString(v) << "\n";
     }
 };
 
 struct Loader {
     const std::map<std::string, std::string>& kv;
     std::string& err;
+    std::string pre;
     const std::string* find(const std::string& k) const {
-        auto it = kv.find(k);
+        auto it = kv.find(pre + k);
         return it == kv.end() ? nullptr : &it->second;
     }
-    void fail(const std::string& k) { err += "bad value for " + k + "; "; }
+    void fail(const std::string& k) { err += "bad value for " + pre + k + "; "; }
     void operator()(const std::string& k, std::string& v) {
         if (auto s = find(k)) v = *s;
     }
@@ -206,13 +213,13 @@ struct Loader {
 
 }  // namespace
 
-bool loadParams(const std::string& path, AppParams& p, std::string* err) {
-    std::ifstream in(path);
+bool readParamFile(const std::string& path, ParamMap& kv, std::string* err) {
+    std::ifstream in(std::filesystem::u8path(path));
     if (!in) {
         if (err) *err = "cannot open " + path;
         return false;
     }
-    std::map<std::string, std::string> kv;
+    kv.clear();
     std::string line;
     while (std::getline(in, line)) {
         line = trim(line);
@@ -227,15 +234,24 @@ bool loadParams(const std::string& path, AppParams& p, std::string* err) {
         if (hash != std::string::npos) val = val.substr(0, hash);
         kv[key] = trim(val);
     }
+    return true;
+}
+
+bool hasSection(const ParamMap& kv, const std::string& prefix) {
+    const auto it = kv.lower_bound(prefix);
+    return it != kv.end() && it->first.compare(0, prefix.size(), prefix) == 0;
+}
+
+std::string readParams(const ParamMap& kv, AppParams& p, const std::string& prefix) {
     std::string localErr;
-    visitParams(p, Loader{kv, localErr});
+    visitParams(p, Loader{kv, localErr, prefix});
 
     // Settings saved before syllables existed had a single target ("seq.*" keys):
     // turn it into a syllable called "target" and select it.
-    if (!kv.count("codes.count") && kv.count("seq.trigger_type")) {
+    if (!kv.count(prefix + "codes.count") && kv.count(prefix + "seq.trigger_type")) {
         SyllableCode c = defaultTargetSyllable();
         auto num = [&](const char* k, double& v) {
-            if (auto it = kv.find(k); it != kv.end()) {
+            if (auto it = kv.find(prefix + k); it != kv.end()) {
                 try { v = std::stod(it->second); } catch (...) {}
             }
         };
@@ -254,8 +270,20 @@ bool loadParams(const std::string& path, AppParams& p, std::string* err) {
         p.codes.target = 0;
     }
     if (p.codes.target >= int(p.codes.list.size())) p.codes.target = -1;
-    if (err) *err = localErr;
-    return localErr.empty();
+    return localErr;
+}
+
+bool loadParams(const std::string& path, AppParams& p, std::string* err) {
+    ParamMap kv;
+    if (!readParamFile(path, kv, err)) return false;
+    const std::string e = readParams(kv, p);
+    if (err) *err = e;
+    return e.empty();
+}
+
+void writeParams(std::ostream& os, const AppParams& p, const std::string& prefix) {
+    AppParams copy = p;
+    visitParams(copy, Saver{os, prefix});
 }
 
 SyllableCode defaultTargetSyllable() {
@@ -280,8 +308,7 @@ bool saveParams(const std::string& path, const AppParams& p, std::string* err) {
         return false;
     }
     out << "# FeedbackPlease settings\n";
-    AppParams copy = p;
-    visitParams(copy, Saver{out});
+    writeParams(out, p);
     return true;
 }
 

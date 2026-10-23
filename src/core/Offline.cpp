@@ -105,10 +105,15 @@ void runDecisions(const EnvelopeTrack& env, const SongTrack& song, const AppPara
         st.detected = st.active;
         const FrameResult r = det.decide(uint64_t(k + 1) * uint64_t(env.frameSamples), env.value[k], st, dtMs);
         out.inSyllable[k] = r.seg.inSyllable ? 1 : 0;
-        if (r.seg.offset && !out.syllables.empty()) {
-            auto& s = out.syllables.back();
-            s.offsetMs = r.tMs;
-            s.sdMs = r.seg.sdMs;
+        if (r.seg.offset) {
+            // The gap turned out real (>= min gap): the frames since the drop were not syllable.
+            const size_t first = size_t(std::max(0.0, std::round(r.seg.offsetMs / dtMs) - 1.0));
+            for (size_t j = first; j <= k; ++j) out.inSyllable[j] = 0;
+            if (!out.syllables.empty()) {
+                auto& s = out.syllables.back();
+                s.offsetMs = r.seg.offsetMs;
+                s.sdMs = r.seg.sdMs;
+            }
         }
         if (r.seg.onset) {
             SyllableInfo s;
@@ -171,7 +176,7 @@ uint64_t songKey(const AppParams& p) {
 
 uint64_t decisionKey(const AppParams& p) {
     Hasher h;
-    h << p.spectrum.sylStartThresh << p.spectrum.sylEndThresh;
+    h << p.spectrum.sylStartThresh << p.spectrum.sylEndThresh << p.spectrum.minGapMs;
     h << p.codes.target;
     const auto& f = p.fb;
     h << f.enabled << f.prob1 << f.delay1Ms << f.thresh1 << f.prob2 << f.delay2Ms << f.thresh2 << int(f.mode2)
