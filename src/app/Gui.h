@@ -108,6 +108,7 @@ private:
     int editSyl_ = 0;         // syllable being edited (shared with the Tune tab)
     int editTmpl_ = 0;        // spectral template being edited (shared with the Tune tab)
     void drawTemplates();
+    void drawBirdName();
     int lastOpenedSyl_ = -1;  // to open the edited syllable's panel once when it changes
     ScopeSnapshot snap_;
     std::vector<double> xs_, ys_;

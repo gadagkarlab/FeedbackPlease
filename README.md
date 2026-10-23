@@ -67,8 +67,8 @@ The left panel has a **Box** selector with **+ Add** (a copy of the current box)
 and **Include in Start**; everything below it is that box's settings. The Live tab shows a table of every
 box (state, song/recording, onsets, target matches, feedback, current code, backlog, errors); click a row
 to see that box's plots and event log and edit its settings. **Start all / Stop all** run every included
-box; Test feedback and Reset counters act on the selected box. Each box records into its output folder
-with its name in the file names (`session_<time>_<box>_*`).
+box; Test feedback and Reset counters act on the selected box. Each box records under its **Bird name**
+(see *Recording*); two boxes with the same bird name and output folder get a warning.
 
 Hardware: boxes are grouped by the NI card of their **AI channel** (a box with *Source = Simulated*
 plays its own synthetic song, so a rig can be tried without hardware). Each card gets one acquisition
@@ -99,12 +99,30 @@ running. Hardware, wave files and recording options apply at the next Start.
 
 ## Recording
 
-Each Start creates `recordings/session_<date>_<time>_*` files (folder set under **Recording**):
+Set the **Bird name** at the top of the box's panel. Files go into a folder per bird and per day (output
+folder set under **Recording**):
 
-- `_settings.ini`: the settings used.
-- `_events.csv`: every onset, offset, syllable classification, match, feedback, song on/off, with the
+```
+recordings/
+  bk12rd34/
+    20261023/
+      bk12rd34_20261023_071502_118.wav          song files, named after their first sample
+      bk12rd34_20261023_071644_903.wav
+      bk12rd34_20261023_065958_session_settings.ini
+      bk12rd34_20261023_065958_session_events.csv
+      bk12rd34_20261023_065958_session_songs.csv
+    20261024/
+      bk12rd34_20261024_000013_402.wav          after midnight: next day's folder
+```
+
+The song file times come from the audio sample clock, anchored to the wall clock at Start, so they stay
+exact however busy the disk is. Session files go to the folder of the day the session started. Without a
+bird name, files go to `unnamed_bird`. Characters not allowed in file names are replaced by `_`.
+
+- `_session_settings.ini`: the settings used.
+- `_session_events.csv`: every onset, offset, syllable classification, match, feedback, song on/off, with the
   sample index since Start.
-- **Song-triggered WAVs** `_song001.wav`, `_song002.wav`, ...: when the song detector turns on, a new
+- **Song-triggered WAVs** `<bird>_YYYYMMDD_HHMMSS_mmm.wav`: when the song detector turns on, a new
   file starts with the last **Pre-roll** seconds of audio (kept in a ring buffer, so the start of the song
   is included) and continues until song has been off for **Post-roll** seconds. Song resuming within the
   post-roll extends the same file. A song that starts soon after a file closed still gets its full
@@ -112,9 +130,10 @@ Each Start creates `recordings/session_<date>_<time>_*` files (folder set under 
   - Channels, each optional, in this order: **raw mic** (V), **detection signal** (linear, held per
     1 ms frame) and **marker track** = 0.1 song + 0.2 syllable + 0.3 target match + 0.4 feedback (the TTL
     line states; every combination is a distinct level).
-  - `_songs.csv` lists each file with its start / end sample on the same clock as the events CSV, its
+  - `_session_songs.csv` lists each file (as `<day>/<name>.wav`) with its start time and its start / end
+    sample on the same clock as the events CSV, its
     duration and the pre-roll it actually got (less than requested right after Start).
-- `_envelope.wav` (optional): the continuous detection signal at the frame rate.
+- `_session_envelope.wav` (optional): the continuous detection signal at the frame rate.
 
 All writing happens on a background thread; the acquisition thread only queues data.
 
@@ -125,8 +144,9 @@ The **Tune on recordings** tab replaces LabVIEW's Kernel Extraction tab. It has 
 what you tune is what runs once applied.
 
 1. **Pick a folder** (Browse..., or type a path and press Enter). The pattern accepts `;`-separated
-   wildcards, e.g. `*.wav;*.WAV`. Step through files with Prev / Next / Random, PageUp / PageDown, or
-   by clicking the list.
+   wildcards, e.g. `*.wav;*.WAV`. **subfolders** (on by default) includes every folder below, so a
+   bird's folder gives all its days. Folders named `rejected` are always skipped. Step through files with
+   Prev / Next / Random, PageUp / PageDown, or by clicking the list.
 2. **File view**: spectrogram, detection signal (log scale, like LabVIEW) and song detector, with
    linked time axes (scroll to zoom, drag to pan, **Zoom full** to reset).
    - Yellow numbers are syllable durations (ms). Cyan numbers are IOIs, shown purple where the target
@@ -360,7 +380,7 @@ Please check these against the original VIs:
 - Zero-duration state transitions happen within one frame (LabVIEW spends one loop iteration
   per state, adding ~1 ms per hop between detection and Sending).
 - The random draw uses a seeded Mersenne Twister and every trial, catch trial and suppression is
-  logged with its sample index to `recordings/session_*_events.csv`, and each song is saved as its own
+  logged with its sample index to the session's `_session_events.csv`, and each song is saved as its own
   WAV with pre-roll (see *Recording*).
 - All processing happens on one time-critical thread; the GUI only reads snapshots, so redrawing
   plots cannot stall acquisition.

@@ -287,7 +287,8 @@ struct RecordingParams {
 };
 
 struct AppParams {
-    std::string boxName = "Box 1";  // used in the multi-box view and in recording file names
+    std::string boxName = "Box 1";  // used in the multi-box view
+    std::string birdName;           // recordings go to <outputDir>/<bird>/<YYYYMMDD>/<bird>_<time>.wav
     bool boxEnabled = true;         // multi-box: included when "Start all" is pressed
     HardwareParams hw;
     SourceParams source;
@@ -314,6 +315,9 @@ bool readParamFile(const std::string& path, ParamMap& kv, std::string* err = nul
 bool hasSection(const ParamMap& kv, const std::string& prefix);
 std::string readParams(const ParamMap& kv, AppParams& p, const std::string& prefix = "");
 void writeParams(std::ostream& os, const AppParams& p, const std::string& prefix = "");
+
+// A bird name made safe for folder and file names ("unnamed_bird" if empty).
+std::string birdFileName(const std::string& bird);
 
 const char* toString(BandCombination c);
 const char* toString(TriggerType t);

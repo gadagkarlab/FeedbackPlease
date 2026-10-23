@@ -125,10 +125,9 @@ public:
     Box& operator=(const Box&) = delete;
 
     // ---- owner side (Engine)
-    // p already has the actual sample rate and frame size. sessionTag goes into file
-    // names ("" in single-box mode, the box name in multi-box mode).
-    bool begin(const AppParams& p, const std::string& backend, const std::string& stamp, const std::string& sessionTag,
-               std::string& err);
+    // p already has the actual sample rate and frame size. Recordings go to
+    // <outputDir>/<bird>/<YYYYMMDD>/ (see openSession).
+    bool begin(const AppParams& p, const std::string& backend, std::string& err);
     // One frame of n samples, on the acquisition thread. Outputs go to io.
     void process(const float* x, int n, IOBackend& io, size_t backlogSamples);
     void finish(IOBackend& io);  // acquisition thread, after the last frame: outputs low
@@ -166,7 +165,7 @@ private:
     };
 
     void logEvent(double tMs, const char* type, const std::string& detail, double value);
-    bool openSession(const AppParams& p, const std::string& stamp, const std::string& tag, std::string& err);
+    bool openSession(const AppParams& p, std::string& err);
 
     // Parameters handed from the GUI to the acquisition thread.
     mutable std::mutex paramMx_;

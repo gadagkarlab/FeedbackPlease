@@ -2,7 +2,8 @@
 // Song-triggered recording: keeps the last preRollSec of audio in a ring buffer.
 // When song starts, a new WAV is opened with that history at the front and recording
 // continues until song has been off for postRollSec; song resuming within that time
-// extends the same file. Each finished file gets a row in <prefix>_songs.csv.
+// extends the same file. Files go to <birdDir>/<YYYYMMDD>/<bird>_YYYYMMDD_HHMMSS_mmm.wav (local
+// time of the file's first sample, from the sample clock); each gets a row in the index CSV.
 //
 // Not thread-safe by itself: the engine hands frames to the recorder thread, which
 // calls push() (see AsyncRecorder in app/Engine.cpp). Status getters are atomic.
@@ -18,7 +19,10 @@
 namespace fp {
 
 struct SongFileConfig {
-    std::string prefix;  // files are <prefix>_song001.wav, ... and <prefix>_songs.csv
+    std::string indexPath;      // CSV with one row per file
+    std::string birdDir;        // day folders are created in here
+    std::string bird;           // file name prefix (already safe for file names)
+    double startEpochMs = 0.0;  // wall-clock time of the first sample pushed (ms since 1970)
     double sampleRate = 40000.0;
     double preRollSec = 2.0;
     double postRollSec = 2.0;
@@ -61,9 +65,15 @@ private:
     size_t preInFile_ = 0;    // samples of pre-roll written at the start of the current file
     int fileNo_ = 0;
     std::string fileName_;
+    std::string fileRel_;    // day/name.wav, for the index
+    double fileTime_ = 0.0;  // wall-clock ms of the current file's first sample
 
     std::atomic<int> filesDone_{0};
     std::atomic<bool> recording_{false};
 };
+
+// Local time of epochMs as "YYYYMMDD" and "YYYYMMDD_HHMMSS_mmm".
+std::string localDay(double epochMs);
+std::string localStamp(double epochMs);
 
 }  // namespace fp

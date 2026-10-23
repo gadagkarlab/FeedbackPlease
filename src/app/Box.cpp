@@ -126,21 +126,21 @@ void AsyncRecorder::close() {
 
 // ---------------------------------------------------------------- Box
 
-bool Box::begin(const AppParams& p, const std::string& backend, const std::string& stamp, const std::string& sessionTag,
-                std::string& err) {
+bool Box::begin(const AppParams& p, const std::string& backend, std::string& err) {
     end();
     startParams_ = p;
     {
         std::lock_guard<std::mutex> lk(paramMx_);
         pending_ = p;
     }
-    if (!openSession(p, stamp, sessionTag, err)) return false;
+    if (!openSession(p, err)) return false;
 
     fs_ = p.hw.sampleRate;
     const int n = p.hw.samplesPerFrame;
     frameMs_ = n * 1000.0 / fs_;
+    // Different seeds per box so their feedback probability draws are independent.
     det_ = std::make_unique<Detector>(uint32_t(std::chrono::high_resolution_clock::now().time_since_epoch().count()) ^
-                                      uint32_t(std::hash<std::string>{}(sessionTag)));
+                                      uint32_t(std::hash<std::string>{}(p.boxName)));
     p_ = p;
     det_->setParams(p_);
     seenVersion_ = paramVersion_.load();
@@ -196,23 +196,37 @@ void Box::setError(const std::string& e) {
     error_ = e;
 }
 
-bool Box::openSession(const AppParams& p, const std::string& stamp, const std::string& tag, std::string& err) {
+// Layout: <outputDir>/<bird>/<YYYYMMDD>/<bird>_YYYYMMDD_HHMMSS_mmm.wav for the song files
+// (day and time of each file's first sample), plus <bird>_<session start>_session_*
+// (settings, events, song index, envelope) in the day the session started.
+bool Box::openSession(const AppParams& p, std::string& err) {
+    namespace fs = std::filesystem;
     std::string prefix;
     const auto& rec = p.rec;
     const bool songFiles = rec.songFiles && (rec.chMic || rec.chDetection || rec.chMarkers);
     if (rec.saveEvents || songFiles || rec.saveEnvelope) {
+        // Sample 0 is (to within a frame) now; song file times count samples from here.
+        const double startMs = double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count());
+        const std::string bird = birdFileName(p.birdName);
+        const fs::path birdDir = fs::u8path(rec.outputDir) / fs::u8path(bird);
+        const fs::path dayDir = birdDir / localDay(startMs);
         std::error_code ec;
-        std::filesystem::create_directories(std::filesystem::u8path(rec.outputDir), ec);
+        fs::create_directories(dayDir, ec);
         if (ec) {
-            err = "cannot create " + rec.outputDir + ": " + ec.message();
+            err = "cannot create " + dayDir.u8string() + ": " + ec.message();
             return false;
         }
-        const std::string name = "session_" + stamp + (tag.empty() ? "" : "_" + tag);
-        prefix = (std::filesystem::u8path(rec.outputDir) / std::filesystem::u8path(name)).u8string();
+        const std::string stamp = localStamp(startMs);
+        prefix = (dayDir / fs::u8path(bird + "_" + stamp.substr(0, 15) + "_session")).u8string();
         saveParams(prefix + "_settings.ini", p);
         const double fs = p.hw.sampleRate;
         SongFileConfig songs;
-        songs.prefix = prefix;
+        songs.indexPath = prefix + "_songs.csv";
+        songs.birdDir = birdDir.u8string();
+        songs.bird = bird;
+        songs.startEpochMs = startMs;
         songs.sampleRate = fs;
         songs.preRollSec = rec.preRollSec;
         songs.postRollSec = rec.postRollSec;

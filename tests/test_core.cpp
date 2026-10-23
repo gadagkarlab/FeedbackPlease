@@ -5,6 +5,8 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -476,8 +478,20 @@ static void testSyllableCodesOnSong() {
 static void testSongFiles() {
     // 1 kHz, 10-sample frames, 0.5 s pre-roll, 0.3 s post-roll. The "mic" signal is the
     // sample index, so each file's first sample and length show exactly what was saved.
+    // The session starts 1 s before midnight (local time), so later files go in the next day's folder.
+    std::tm tm{};
+    tm.tm_year = 2026 - 1900;
+    tm.tm_mon = 9;
+    tm.tm_mday = 23;
+    tm.tm_hour = 23;
+    tm.tm_min = 59;
+    tm.tm_sec = 59;
+    tm.tm_isdst = -1;
     SongFileConfig cfg;
-    cfg.prefix = "fp_songtest";
+    cfg.birdDir = "fp_songtest_dir";
+    cfg.bird = "Zf1";
+    cfg.indexPath = "fp_songtest_songs.csv";
+    cfg.startEpochMs = double(std::mktime(&tm)) * 1000.0;
     cfg.sampleRate = 1000.0;
     cfg.preRollSec = 0.5;
     cfg.postRollSec = 0.3;
@@ -502,18 +516,21 @@ static void testSongFiles() {
 
     // {first sample, length}: pre-roll (up to 500) + song + 300 post-roll.
     const std::pair<int, int> expected[4] = {{500, 1500}, {2500, 900}, {2950, 850}, {3500, 700}};
+    // Named after each file's first sample: 23:59:59 + 0.5 s, + 2.5 s (next day), ...
+    const char* names[4] = {"fp_songtest_dir/20261023/Zf1_20261023_235959_500.wav",
+                            "fp_songtest_dir/20261024/Zf1_20261024_000001_500.wav",
+                            "fp_songtest_dir/20261024/Zf1_20261024_000001_950.wav",
+                            "fp_songtest_dir/20261024/Zf1_20261024_000002_500.wav"};
     for (int k = 0; k < 4; ++k) {
-        char name[64];
-        std::snprintf(name, sizeof name, "fp_songtest_song%03d.wav", k + 1);
+        const char* name = names[k];
         WavData d;
         CHECK(readWav(name, d));
         const auto [first, len] = expected[k];
         bool contiguous = d.samples.size() == size_t(len);
         for (size_t i = 0; contiguous && i < d.samples.size(); ++i) contiguous = d.samples[i] == float(first + int(i));
-        std::printf("  song%03d: starts at sample %.0f, %zu samples (expect %d, %d)\n", k + 1,
+        std::printf("  %s: starts at sample %.0f, %zu samples (expect %d, %d)\n", name,
                     d.samples.empty() ? -1.0 : d.samples[0], d.samples.size(), first, len);
         CHECK(contiguous);
-        std::remove(name);
     }
     std::ifstream idx("fp_songtest_songs.csv");
     int rows = 0;
@@ -521,6 +538,7 @@ static void testSongFiles() {
     idx.close();
     CHECK(rows == 5);  // header + 4 files
     std::remove("fp_songtest_songs.csv");
+    std::filesystem::remove_all("fp_songtest_dir");
 }
 
 static void testNoiseBurst() {

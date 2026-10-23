@@ -716,6 +716,9 @@ void TuneView::drawBrowser(AppParams& p) {
     ImGui::InputText("pattern", &pattern_);
     ImGui::SameLine();
     ImGui::Checkbox("subfolders", &recursive_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Include every folder below this one (e.g. all days of a bird), except folders named "
+                          "'rejected' (files moved out by the clean-up). Press Scan after changing.");
     ImGui::SameLine();
     if (ImGui::Button("Scan") || enter) scanFolder();
     ImGui::SameLine();

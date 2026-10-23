@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -33,6 +34,7 @@ void floatList(F& f, const std::string& key, std::vector<float>& v) {
 template <class F>
 void visitParams(AppParams& p, F&& f) {
     f("box_name", p.boxName);
+    f("bird_name", p.birdName);
     f("box_enabled", p.boxEnabled);
     f("hw.ai_channel", p.hw.aiChannel);
     f("hw.ao_stream_ms", p.hw.aoStreamMs);
@@ -336,6 +338,15 @@ bool loadParams(const std::string& path, AppParams& p, std::string* err) {
 void writeParams(std::ostream& os, const AppParams& p, const std::string& prefix) {
     AppParams copy = p;
     visitParams(copy, Saver{os, prefix});
+}
+
+std::string birdFileName(const std::string& bird) {
+    std::string s;
+    for (unsigned char c : bird) s += (c < 32 || std::strchr("<>:\"/\\|?*", c)) ? '_' : char(c);
+    // Windows doesn't allow names ending in a space or dot.
+    const auto b = s.find_first_not_of(" ."), e = s.find_last_not_of(" .");
+    s = b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+    return s.empty() ? "unnamed_bird" : s;
 }
 
 int templateBands(const TemplateParams& t) {

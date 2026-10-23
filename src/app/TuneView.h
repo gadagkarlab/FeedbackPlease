@@ -135,7 +135,7 @@ private:
     // Folder / files
     std::string folder_;
     std::string pattern_ = "*.wav";
-    bool recursive_ = false;
+    bool recursive_ = true;  // recordings are in <bird>/<date>/ folders
     std::vector<std::string> files_;
     int selected_ = -1;
     std::string scanError_;

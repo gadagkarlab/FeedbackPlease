@@ -12,30 +12,6 @@
 
 namespace fp {
 
-namespace {
-
-std::string timestamp() {
-    std::time_t t = std::time(nullptr);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof buf, "%Y%m%d_%H%M%S", &tm);
-    return buf;
-}
-
-// Box name as it appears in file names.
-std::string fileTag(const std::string& name) {
-    std::string t;
-    for (char c : name) t += std::isalnum((unsigned char)c) || c == '-' ? c : '_';
-    return t.empty() ? "box" : t;
-}
-
-}  // namespace
-
 // ---------------------------------------------------------------- sources
 
 bool SingleSource::start(std::string& err) {
@@ -125,7 +101,6 @@ bool Engine::start(const std::vector<AppParams>& boxes, bool single, std::string
     }
     boxes_.resize(boxes.size());
     for (auto& b : boxes_) b = std::make_unique<Box>();
-    const std::string stamp = timestamp();
     for (auto& r : runners) {
         for (int k = 0; k < int(r->boxes.size()); ++k) {
             const int i = r->boxes[size_t(k)];
@@ -133,7 +108,7 @@ bool Engine::start(const std::vector<AppParams>& boxes, bool single, std::string
             p.hw.sampleRate = r->src->sampleRate();
             p.hw.samplesPerFrame = r->src->frameSamples();
             std::string e;
-            if (!boxes_[size_t(i)]->begin(p, r->src->name(), stamp, single ? "" : fileTag(p.boxName), e))
+            if (!boxes_[size_t(i)]->begin(p, r->src->name(), e))
                 return fail(p.boxName + ": " + e);
         }
     }

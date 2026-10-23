@@ -261,6 +261,7 @@ void Gui::draw() {
         drawControls();
     } else {
         if (mode_ == AppMode::Multi) drawBoxBar();
+        drawBirdName();
         drawControls();
     }
     ImGui::EndChild();
@@ -481,17 +482,43 @@ void Gui::drawBoxBar() {
     ImGui::Separator();
 }
 
+// Top of each box's panel: who is in the box, and where its recordings go.
+void Gui::drawBirdName() {
+    AppParams& b = P();
+    ImGui::BeginDisabled(engine_.running());
+    ImGui::SetNextItemWidth(14 * em());
+    if (ImGui::InputTextWithHint("Bird name", "e.g. bk12rd34", &b.birdName)) changed() = true;
+    ImGui::EndDisabled();
+    HelpMarker("Recordings go to <output dir>/<bird>/<YYYYMMDD>/<bird>_YYYYMMDD_HHMMSS_mmm.wav, named after the "
+               "time of each file's first sample. Session files (settings, events, song list) go to the folder of "
+               "the day the session started. Takes effect at the next Start.");
+    const std::string bird = birdFileName(b.birdName);
+    if (b.birdName.empty())
+        ImGui::TextColored(kAmber, "No bird name: recordings go to '%s'.", bird.c_str());
+    else
+        ImGui::TextDisabled("-> %s/%s/<date>/", b.rec.outputDir.c_str(), bird.c_str());
+    if (mode_ == AppMode::Multi && !b.birdName.empty())
+        for (int i = 0; i < int(boxes_.size()); ++i)
+            if (i != selBox_ && birdFileName(boxes_[size_t(i)].birdName) == bird &&
+                boxes_[size_t(i)].rec.outputDir == b.rec.outputDir) {
+                ImGui::TextColored(kAmber, "%s has the same bird name: their files would be mixed.",
+                                   boxes_[size_t(i)].boxName.c_str());
+                break;
+            }
+    ImGui::Separator();
+}
+
 // Multi-box Live tab: one row per box; click a row to show that box below.
 void Gui::drawOverview() {
     const float rowH = ImGui::GetTextLineHeightWithSpacing();
     const float h = std::min(ImGui::GetContentRegionAvail().y * 0.35f, rowH * float(boxes_.size() + 2));
-    if (!ImGui::BeginTable("boxes", 10,
+    if (!ImGui::BeginTable("boxes", 11,
                            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_ScrollY |
                                ImGuiTableFlags_SizingStretchProp,
                            ImVec2(0, h)))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
-    for (const char* c : {"box", "state", "mic", "song", "onsets", "target", "feedback", "code", "backlog", "error"})
+    for (const char* c : {"box", "bird", "state", "mic", "song", "onsets", "target", "feedback", "code", "backlog", "error"})
         ImGui::TableSetupColumn(c);
     ImGui::TableHeadersRow();
     for (int i = 0; i < int(boxes_.size()); ++i) {
@@ -504,6 +531,9 @@ void Gui::drawOverview() {
         ImGui::PushID(i);
         if (ImGui::Selectable(p.boxName.c_str(), i == selBox_, ImGuiSelectableFlags_SpanAllColumns)) selBox_ = i;
         ImGui::PopID();
+        ImGui::TableNextColumn();
+        if (p.birdName.empty()) ImGui::TextColored(kDim, "-");
+        else ImGui::TextUnformatted(p.birdName.c_str());
         ImGui::TableNextColumn();
         if (!p.boxEnabled)
             ImGui::TextColored(kDim, "excluded");
@@ -1273,8 +1303,9 @@ void Gui::drawRecording() {
     HelpMarker("When the song detector turns on, a new WAV starts with the last 'Pre-roll' seconds of audio "
                "(so the start of the song is included) and keeps recording until song has been off for "
                "'Post-roll' seconds. Song coming back within the post-roll extends the same file.\n"
-               "Files: <session>_song001.wav, ... plus <session>_songs.csv listing each file's start/end sample "
-               "(same clock as the events CSV).");
+               "Files: <output>/<bird>/<YYYYMMDD>/<bird>_YYYYMMDD_HHMMSS_mmm.wav (time of the file's first "
+               "sample), plus <bird>_<start>_session_songs.csv listing each file's start/end sample (same clock as "
+               "the events CSV).");
     ImGui::BeginDisabled(!r.songFiles);
     InputD("Pre-roll (s)", &r.preRollSec, "%.3g", 5);
     r.preRollSec = std::clamp(r.preRollSec, 0.0, 60.0);
