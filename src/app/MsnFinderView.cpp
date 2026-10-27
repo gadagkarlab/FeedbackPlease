@@ -72,10 +72,20 @@ void MsnFinderView::load(const std::string& path, std::string* status) {
     I("label", p_.label);
     I("nbins", p_.nbins);
     I("minSpikes", p_.minSpikes);
-    I("nUnits", p_.nUnits);
+    if (kv.count("includeLow")) p_.includeLow = kv["includeLow"] == "1";
     D("pad", p_.pad);
     D("winMs", p_.winMs);
     I("roll", p_.roll);
+    I("rankMode", p_.rankMode);
+    D("minSparseness", p_.minSparseness);
+    D("boutGapS", p_.boutGapS);
+    D("nonSongMarginS", p_.nonSongMarginS);
+    D("maxSongRate", p_.maxSongRate);
+    D("maxNonSongRate", p_.maxNonSongRate);
+    D("minWidthMs", p_.minWidthMs);
+    I("minSongSpikes", p_.minSongSpikes);
+    I("widthSource", p_.widthSource);
+    I("rawSpikes", p_.rawSpikes);
     if (status) *status = "Loaded " + path;
 }
 
@@ -88,8 +98,12 @@ bool MsnFinderView::save(const std::string& path, std::string* err) const {
     f << "# FeedbackPlease MSN finder settings\n"
       << "pythonExe=" << p_.pythonExe << "\nscript=" << p_.script << "\nrunDir=" << p_.runDir << "\nksName=" << p_.ksName
       << "\ncacheDir=" << p_.cacheDir << "\ngoodOnly=" << (p_.goodOnly ? 1 : 0) << "\nmaxRateHz=" << p_.maxRateHz
-      << "\nlabel=" << p_.label << "\nnbins=" << p_.nbins << "\nminSpikes=" << p_.minSpikes << "\nnUnits=" << p_.nUnits
-      << "\npad=" << p_.pad << "\nwinMs=" << p_.winMs << "\nroll=" << p_.roll << "\n";
+      << "\nlabel=" << p_.label << "\nnbins=" << p_.nbins << "\nminSpikes=" << p_.minSpikes << "\nincludeLow=" << (p_.includeLow ? 1 : 0)
+      << "\npad=" << p_.pad << "\nwinMs=" << p_.winMs << "\nroll=" << p_.roll << "\nrankMode=" << p_.rankMode
+      << "\nminSparseness=" << p_.minSparseness
+      << "\nboutGapS=" << p_.boutGapS << "\nnonSongMarginS=" << p_.nonSongMarginS << "\nmaxSongRate=" << p_.maxSongRate
+      << "\nmaxNonSongRate=" << p_.maxNonSongRate << "\nminWidthMs=" << p_.minWidthMs << "\nminSongSpikes=" << p_.minSongSpikes
+      << "\nwidthSource=" << p_.widthSource << "\nrawSpikes=" << p_.rawSpikes << "\n";
     return bool(f);
 }
 
@@ -98,6 +112,7 @@ bool MsnFinderView::save(const std::string& path, std::string* err) const {
 
 void MsnFinderView::drawParams() {
     const bool busy = backend_.busy();
+    const auto s0 = backend_.session();
 
     auto pathField = [&](const char* label, std::string* s, int kind, const char* hint = nullptr) {
         ImGui::PushID(label);
@@ -146,6 +161,20 @@ void MsnFinderView::drawParams() {
 
     if (ImGui::CollapsingHeader("Syllable and ranking", ImGuiTreeNodeFlags_DefaultOpen)) {
         const auto s = backend_.session();
+        {
+            const char* modes[3] = {"Variance (syllable-locked)", "Type-1 likeness", "Sparseness (paper)"};
+            ImGui::SetNextItemWidth(14 * em());
+            if (ImGui::BeginCombo("Rank by", modes[std::clamp(p_.rankMode, 0, 2)])) {
+                for (int m = 0; m < 3; ++m)
+                    if (ImGui::Selectable(modes[m], p_.rankMode == m)) p_.rankMode = m;
+                ImGui::EndCombo();
+            }
+            HelpMarker("Variance: units whose spikes fall at one time within the chosen syllable come first.\n"
+                       "Type-1 likeness: units that look like the medium spiny neurons of Goldberg & Fee 2010 come first: low "
+                       "firing rate during song, nearly silent outside song, wide spike. The syllable only sets the figure shown.\n"
+                       "Sparseness: the paper's entropy index of syllable-aligned firing (10 ms bins, all syllables with 30+ "
+                       "renditions together); units that fire in a few brief moments of the song come first.");
+        }
         std::string cur = "label " + std::to_string(p_.label);
         if (s)
             for (size_t i = 0; i < s->labels.size(); ++i)
@@ -157,8 +186,9 @@ void MsnFinderView::drawParams() {
                     const std::string item = "label " + std::to_string(s->labels[i]) + "  (n=" + std::to_string(s->labelCounts[i]) + ")";
                     if (ImGui::Selectable(item.c_str(), s->labels[i] == p_.label)) {
                         p_.label = s->labels[i];
+                        reqLabel_ = -1;
                         std::string err;
-                        if (!backend_.requestRank(p_.label, p_.nbins, p_.minSpikes, p_.nUnits, err)) message_ = err;
+                        if (!backend_.requestRank(p_.label, p_.nbins, p_.minSpikes, err)) message_ = err;
                     }
                 }
             } else {
@@ -173,15 +203,95 @@ void MsnFinderView::drawParams() {
                    "variance of that distribution is the ranking criterion (low = spikes concentrated at one time).");
         InputI("Min spikes", &p_.minSpikes, 6);
         HelpMarker("Skip units with fewer spikes than this in the syllable window.");
-        InputI("Show lowest-variance units", &p_.nUnits, 6);
-        HelpMarker("How many units to list. 0 = all that pass.");
+        if (p_.rankMode != 0) {
+            Check("Include low-spike units", &p_.includeLow);
+            HelpMarker("Also list the units that fail the spike-count criteria (Min spikes; Min spikes in song in type-1 mode), "
+                       "after the ranked ones and in grey. Their rates and indices rest on very few spikes. Either way, a grey dot "
+                       "in the scatters can be clicked to view that unit.");
+        }
         ImGui::BeginDisabled(busy || !s);
         if (ImGui::Button("Rank units")) {
             std::string err;
-            if (backend_.requestRank(p_.label, p_.nbins, p_.minSpikes, p_.nUnits, err)) message_.clear();
+            if (backend_.requestRank(p_.label, p_.nbins, p_.minSpikes, err)) message_.clear();
             else message_ = err;
         }
         ImGui::EndDisabled();
+    }
+
+    if (p_.rankMode == 2 && ImGui::CollapsingHeader("Sparseness", ImGuiTreeNodeFlags_DefaultOpen)) {
+        InputD("Sparse above", &p_.minSparseness, "%.2f", 6);
+        p_.minSparseness = std::clamp(p_.minSparseness, 0.0, 1.0);
+        HelpMarker("Units at or above this index are drawn green in the scatters. Paper: type-1 0.45 +- 0.14, types 2-4 about 0.02. "
+                   "1 = all firing in one 10 ms bin, 0 = spread evenly over the song. Units with fewer than 'Min spikes' spikes "
+                   "in the syllable windows are not listed (the index is meaningless on a handful of spikes).");
+        if (const auto cl = backend_.classification()) {
+            int n = 0;
+            for (double v : cl->sparseness) n += std::isfinite(v);
+            ImGui::TextDisabled("%d units have an index", n);
+        }
+    }
+
+    if (p_.rankMode == 1 && ImGui::CollapsingHeader("Type-1 criteria and song bouts", ImGuiTreeNodeFlags_DefaultOpen)) {
+        InputD("Song rate below (Hz)", &p_.maxSongRate, "%.3g", 6);
+        HelpMarker("Mean instantaneous rate (1 / enclosing inter-spike interval, averaged over time) during song. Paper: < 10 Hz.");
+        InputD("Non-song rate below (Hz)", &p_.maxNonSongRate, "%.3g", 6);
+        HelpMarker("Same measure far from song. Paper: < 0.01 Hz, i.e. essentially silent.");
+        InputD("Spike half-width above (ms)", &p_.minWidthMs, "%.3g", 6);
+        HelpMarker("Half-width of the unit's dominant deflection (a peak-dominant unit is flipped; marked (+) in the table). "
+                   "Paper: > 0.06 ms on mean waveforms; check the scatter for where your units actually fall.");
+        {
+            const char* src[2] = {"Kilosort template", "Mean raw waveform"};
+            ImGui::SetNextItemWidth(14 * em());
+            if (ImGui::BeginCombo("Width from", src[std::clamp(p_.widthSource, 0, 1)])) {
+                for (int m = 0; m < 2; ++m)
+                    if (ImGui::Selectable(src[m], p_.widthSource == m)) p_.widthSource = m;
+                ImGui::EndCombo();
+            }
+            HelpMarker("Template: from the Kilosort template of the unit's peak channel. Mean raw waveform: average of the unit's "
+                       "spikes read from the .ap.bin (30 kHz, upsampled 8x, each spike aligned on its own trough or peak before "
+                       "averaging); measure it first with the button below.");
+            InputI("Spikes per unit", &p_.rawSpikes, 6);
+            p_.rawSpikes = std::clamp(p_.rawSpikes, 10, 2000);
+            ImGui::BeginDisabled(busy || !s0);
+            if (ImGui::Button("Measure raw waveforms")) {
+                std::string err;
+                if (backend_.requestRawWidths(p_.rawSpikes, err)) message_.clear();
+                else message_ = err;
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (const auto rw = backend_.rawWidths()) ImGui::TextDisabled("%d units measured", int(rw->units.size()));
+            else ImGui::TextDisabled("not measured (about a minute)");
+            if (p_.widthSource == 1 && !backend_.rawWidths()) ImGui::TextColored(kAmber, "Using template widths until the raw waveforms are measured.");
+        }
+        InputI("Min spikes in song", &p_.minSongSpikes, 6);
+        p_.minSongSpikes = std::max(0, p_.minSongSpikes);
+        HelpMarker("Units with fewer spikes during song are not listed (they are not singing-related).");
+        ImGui::Separator();
+        InputD("Bout gap (s)", &p_.boutGapS, "%.3g", 6);
+        p_.boutGapS = std::max(0.0, p_.boutGapS);
+        HelpMarker("Sound pulses (digital line high while the mic is over threshold) closer together than this belong to one song bout.");
+        InputD("Non-song margin (s)", &p_.nonSongMarginS, "%.3g", 6);
+        p_.nonSongMarginS = std::max(0.0, p_.nonSongMarginS);
+        HelpMarker("Non-song time is further than this from every bout. The paper uses 10 s; a run with little silence "
+                   "may have no such time (see below).");
+        ImGui::BeginDisabled(busy || !s0);
+        if (ImGui::Button("Recompute rates")) {
+            std::string err;
+            if (backend_.requestClassify(p_.boutGapS, p_.nonSongMarginS, err)) message_.clear();
+            else message_ = err;
+        }
+        ImGui::EndDisabled();
+        if (const auto cl = backend_.classification()) {
+            ImGui::TextDisabled("%d bouts, %.0f s of song, %.0f s of non-song", cl->nBouts, cl->songSec, cl->nonSongSec);
+            if (cl->nonSongSec < 30.0)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, kAmber);
+                ImGui::TextWrapped("Little or no non-song time: the outside-song rate is %s.",
+                                   cl->nonSongSec <= 0 ? "unavailable (ignored in the ranking)" : "unreliable");
+                ImGui::PopStyleColor();
+            }
+        }
     }
 
     if (ImGui::CollapsingHeader("Figure", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -212,8 +322,90 @@ void MsnFinderView::drawParams() {
 // Synchronisation with the back end
 
 void MsnFinderView::selectRank(int r) {
-    if (!ranking_ || ranking_->rows.empty()) return;
-    sel_ = std::clamp(r, 0, int(ranking_->rows.size()) - 1);
+    if (cands_.empty()) return;
+    sel_ = std::clamp(r, 0, int(cands_.size()) - 1);
+    extraUnit_ = -1;
+    selUnit_ = cands_[sel_].unit;
+}
+
+int MsnFinderView::curUnit() const {
+    if (extraUnit_ >= 0) return extraUnit_;
+    return cands_.empty() ? -1 : cands_[std::clamp(sel_, 0, int(cands_.size()) - 1)].unit;
+}
+
+int MsnFinderView::curLabel() const {
+    if (extraUnit_ >= 0 && p_.rankMode != 0) return p_.label;
+    if (cands_.empty()) return -1;
+    if (p_.rankMode != 0) return p_.label;
+    return ranking_ ? ranking_->label : -1;
+}
+
+namespace {
+double finiteOr(double v, double d) { return std::isfinite(v) ? v : d; }
+// How far a unit is from meeting every type-1 criterion, in decades (<= 0: meets them all; the more negative,
+// the more clearly). A criterion that cannot be evaluated (no non-song time) is skipped.
+double type1Score(const MsnClassification& c, size_t i, const MsnParams& p, double width) {
+    const double floorRate = 1e-4;
+    double worst = -1e9;
+    if (std::isfinite(c.songRate[i])) worst = std::max(worst, std::log10(std::max(c.songRate[i], floorRate) / p.maxSongRate));
+    else worst = std::max(worst, 5.0);
+    if (std::isfinite(c.nonSongRate[i])) worst = std::max(worst, std::log10(std::max(c.nonSongRate[i], floorRate) / p.maxNonSongRate));
+    if (std::isfinite(width)) worst = std::max(worst, std::log10(p.minWidthMs / std::max(width, 1e-3)));
+    else worst = std::max(worst, 5.0);
+    return worst;
+}
+// Ranked units first (best first), then the ones that fail the spike-count criteria (if listed).
+template <class V>
+void sortCands(V& v) {
+    std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.low != b.low ? !a.low : a.score < b.score; });
+}
+}  // namespace
+
+// The list of units to page through for the current ranking mode, best first. Rebuilt only when its inputs change.
+// Spike width used for unit i of the classification: mean raw waveform if chosen and measured, else the template.
+double MsnFinderView::effWidth(size_t i) const {
+    if (p_.widthSource == 1 && raw_ && cls_ && i < cls_->units.size()) {
+        const auto it = rawIndex_.find(cls_->units[i]);
+        if (it != rawIndex_.end() && std::isfinite(raw_->widthMs[it->second])) return raw_->widthMs[it->second];
+    }
+    return cls_ && i < cls_->widthMs.size() ? cls_->widthMs[i] : double(NAN);
+}
+
+void MsnFinderView::rebuildCandidates() {
+    char key[256];
+    std::snprintf(key, sizeof key, "%d|%llu|%llu|%llu|%d|%g|%g|%g|%d|%d|%d|%g|%d", p_.rankMode, (unsigned long long)seenRanking_,
+                  (unsigned long long)seenClass_, (unsigned long long)seenRaw_, p_.widthSource, p_.maxSongRate, p_.maxNonSongRate, p_.minWidthMs, p_.minSongSpikes, int(p_.includeLow),
+                  int(p_.label), p_.minSparseness, p_.minSpikes);
+    if (candKey_ == key) return;
+    candKey_ = key;
+
+    std::vector<Cand> out;
+    if (p_.rankMode == 0) {
+        if (ranking_)
+            for (const auto& r : ranking_->rows) out.push_back({r.unit, r.variance, -1, false, false});
+    } else if (cls_ && p_.rankMode == 2) {
+        for (size_t i = 0; i < cls_->units.size(); ++i) {
+            const bool ok = std::isfinite(cls_->sparseness[i]) && cls_->sparseN[i] >= p_.minSpikes;
+            if (!ok && !p_.includeLow) continue;
+            const double sp = cls_->sparseness[i];
+            out.push_back({cls_->units[i], std::isfinite(sp) ? -sp : 1e9, int(i), ok && sp >= p_.minSparseness, !ok});
+        }
+        sortCands(out);
+    } else if (cls_) {
+        for (size_t i = 0; i < cls_->units.size(); ++i) {
+            const bool ok = cls_->nSong[i] >= p_.minSongSpikes;
+            if (!ok && !p_.includeLow) continue;
+            const double sc = type1Score(*cls_, i, p_, effWidth(i));
+            out.push_back({cls_->units[i], sc, int(i), ok && sc <= 0, !ok});
+        }
+        sortCands(out);
+    }
+    cands_ = std::move(out);
+
+    sel_ = 0;
+    for (size_t i = 0; i < cands_.size(); ++i)
+        if (cands_[i].unit == selUnit_) sel_ = int(i);
+    selUnit_ = cands_.empty() ? -1 : cands_[size_t(sel_)].unit;
 }
 
 void MsnFinderView::prepareSpec(const MsnSpec& s) {
@@ -252,20 +444,38 @@ void MsnFinderView::sync() {
         seenSession_ = backend_.sessionVersion();
         session_ = backend_.session();
         ranking_.reset();
+        cls_.reset();
+        raw_.reset();
+        rawIndex_.clear();
         fig_.reset();
         reqLabel_ = reqUnit_ = -1;
         sel_ = 0;
+        selUnit_ = -1;
+        candKey_.clear();
         if (session_ && !session_->labels.empty()) {
             if (std::find(session_->labels.begin(), session_->labels.end(), p_.label) == session_->labels.end())
                 p_.label = session_->labels.front();
             std::string err;
-            if (!backend_.requestRank(p_.label, p_.nbins, p_.minSpikes, p_.nUnits, err)) message_ = err;
+            if (!backend_.requestRank(p_.label, p_.nbins, p_.minSpikes, err)) message_ = err;
+            if (!backend_.requestClassify(p_.boutGapS, p_.nonSongMarginS, err)) message_ = err;
         }
+    }
+    if (backend_.classificationVersion() != seenClass_) {
+        seenClass_ = backend_.classificationVersion();
+        cls_ = backend_.classification();
+        reqLabel_ = reqUnit_ = -1;
+    }
+    if (backend_.rawWidthsVersion() != seenRaw_) {
+        seenRaw_ = backend_.rawWidthsVersion();
+        raw_ = backend_.rawWidths();
+        rawIndex_.clear();
+        if (raw_)
+            for (size_t i = 0; i < raw_->units.size(); ++i) rawIndex_[raw_->units[i]] = i;
+        reqLabel_ = reqUnit_ = -1;
     }
     if (backend_.rankingVersion() != seenRanking_) {
         seenRanking_ = backend_.rankingVersion();
         ranking_ = backend_.ranking();
-        sel_ = 0;
         reqLabel_ = reqUnit_ = -1;
     }
     if (backend_.figureVersion() != seenFigure_) {
@@ -283,23 +493,16 @@ void MsnFinderView::sync() {
         }
     }
 
+    rebuildCandidates();
+
     // Ask for the figure of the selected unit (one request at a time; flipping fast just skips ahead).
-    if (ranking_ && !ranking_->rows.empty() && !backend_.busy()) {
-        sel_ = std::clamp(sel_, 0, int(ranking_->rows.size()) - 1);
-        const int unit = ranking_->rows[sel_].unit;
-        if (unit != reqUnit_ || ranking_->label != reqLabel_ || p_.pad != reqPad_) {
-            std::string err;
-            if (backend_.requestFigure(ranking_->label, unit, p_.pad, err)) {
-                reqUnit_ = unit;
-                reqLabel_ = ranking_->label;
-                reqPad_ = p_.pad;
-            } else {
-                message_ = err;
-                reqUnit_ = unit;  // don't retry every frame
-                reqLabel_ = ranking_->label;
-                reqPad_ = p_.pad;
-            }
-        }
+    const int unit = curUnit(), label = curLabel();
+    if (unit >= 0 && label >= 0 && !backend_.busy() && (unit != reqUnit_ || label != reqLabel_ || p_.pad != reqPad_)) {
+        std::string err;
+        if (!backend_.requestFigure(label, unit, p_.pad, err)) message_ = err;
+        reqUnit_ = unit;  // also on failure: don't retry every frame
+        reqLabel_ = label;
+        reqPad_ = p_.pad;
     }
 }
 
@@ -329,8 +532,9 @@ void MsnFinderView::drawStatus() {
 }
 
 void MsnFinderView::drawRankTable(float height) {
-    if (!ranking_ || ranking_->rows.empty()) return;
-    if (!ImGui::BeginTable("msn_rank", 5,
+    if (cands_.empty()) return;
+    const bool t1 = p_.rankMode != 0;
+    if (!ImGui::BeginTable("msn_rank", t1 ? 9 : 5,
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                ImGuiTableFlags_SizingStretchProp,
                            ImVec2(0, height)))
@@ -338,35 +542,186 @@ void MsnFinderView::drawRankTable(float height) {
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("rank");
     ImGui::TableSetupColumn("unit");
-    ImGui::TableSetupColumn("variance (ms^2)");
-    ImGui::TableSetupColumn("spikes");
-    ImGui::TableSetupColumn("peak (ms)");
+    if (t1) {
+        ImGui::TableSetupColumn("song rate (Hz)");
+        ImGui::TableSetupColumn("non-song (Hz)");
+        ImGui::TableSetupColumn("width (ms)");
+        ImGui::TableSetupColumn("peak in song (Hz)");
+        ImGui::TableSetupColumn("song spikes");
+        ImGui::TableSetupColumn("sparseness");
+        ImGui::TableSetupColumn(p_.rankMode == 2 ? "sparse?" : "type 1?");
+    } else {
+        ImGui::TableSetupColumn("variance (ms^2)");
+        ImGui::TableSetupColumn("spikes");
+        ImGui::TableSetupColumn("peak (ms)");
+    }
     ImGui::TableHeadersRow();
-    for (int i = 0; i < int(ranking_->rows.size()); ++i) {
-        const MsnRankRow& r = ranking_->rows[i];
+    for (int i = 0; i < int(cands_.size()); ++i) {
+        const Cand& c = cands_[size_t(i)];
         ImGui::TableNextRow();
+        if (c.low) ImGui::PushStyleColor(ImGuiCol_Text, kGrey);
         ImGui::TableNextColumn();
         char lab[32];
         std::snprintf(lab, sizeof lab, "%d##r%d", i + 1, i);
-        if (ImGui::Selectable(lab, i == sel_, ImGuiSelectableFlags_SpanAllColumns)) sel_ = i;
+        if (ImGui::Selectable(lab, i == sel_, ImGuiSelectableFlags_SpanAllColumns)) selectRank(i);
         ImGui::TableNextColumn();
-        ImGui::Text("%d", r.unit);
-        ImGui::TableNextColumn();
-        ImGui::Text("%.0f", r.variance);
-        ImGui::TableNextColumn();
-        ImGui::Text("%.0f", r.nSpikes);
-        ImGui::TableNextColumn();
-        ImGui::Text("%.0f", r.peakMs);
+        ImGui::Text("%d", c.unit);
+        if (t1 && cls_ && c.cls >= 0) {
+            const size_t k = size_t(c.cls);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.2f", cls_->songRate[k]);
+            ImGui::TableNextColumn();
+            if (std::isfinite(cls_->nonSongRate[k])) ImGui::Text("%.4f", cls_->nonSongRate[k]);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            {
+                const double wv = effWidth(k);
+                double pol = cls_->polarity[k];
+                if (p_.widthSource == 1 && raw_) {
+                    const auto ri = rawIndex_.find(c.unit);
+                    if (ri != rawIndex_.end() && raw_->polarity[ri->second] != 0) pol = raw_->polarity[ri->second];
+                }
+                ImGui::Text("%.3f%s", wv, pol < 0 ? " (+)" : "");
+            }
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", cls_->peakRate[k]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", cls_->nSong[k]);
+            ImGui::TableNextColumn();
+            if (std::isfinite(cls_->sparseness[k])) ImGui::Text("%.3f", cls_->sparseness[k]);
+            else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn();
+            if (c.meets) ImGui::TextColored(kGreen, "yes");
+            else if (p_.rankMode == 2) ImGui::TextDisabled("no");
+            else ImGui::TextDisabled("%.1f dec. off", c.score);
+        } else if (!t1 && ranking_ && i < int(ranking_->rows.size())) {
+            const MsnRankRow& r = ranking_->rows[size_t(i)];
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", r.variance);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", r.nSpikes);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", r.peakMs);
+        }
+        if (c.low) ImGui::PopStyleColor();
     }
     ImGui::EndTable();
+}
+
+// The classification scatters of Goldberg & Fee 2010, Fig. 1D-F: song rate vs non-song rate, song rate vs spike
+// width, peak song rate vs spike width. Gray: units that are not ranked (few spikes); blue: on the list; green: meets every type-1
+// criterion; red: the unit being viewed (click any listed unit to jump to it).
+void MsnFinderView::drawScatters(float height) {
+    if (!cls_ || cls_->units.empty()) return;
+    const MsnClassification& c = *cls_;
+    const double zeroX = 3e-4;  // rates of exactly 0 can't be shown on a log axis: drawn here
+    auto logRate = [&](double v) { return std::isfinite(v) ? std::max(v, zeroX) : double(NAN); };
+
+    std::map<int, int> rowOf;  // unit -> position in cands_
+    for (size_t i = 0; i < cands_.size(); ++i) rowOf[cands_[i].unit] = int(i);
+
+    const float w = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 4.0f;
+    struct Spec {
+        const char* id;
+        const char* xl;
+        const char* yl;
+        bool xLog;
+        double x0, x1, y0, y1;
+        double vx, hy;  // threshold lines
+    };
+    const Spec specs[4] = {
+        {"##sc_rates", "non-song rate (Hz)", "song rate (Hz)", true, 1e-4, 300, 1e-2, 300, p_.maxNonSongRate, p_.maxSongRate},
+        {"##sc_width_rate", "spike half-width (ms)", "song rate (Hz)", false, 0, 0.6, 1e-2, 300, p_.minWidthMs, p_.maxSongRate},
+        {"##sc_width_peak", "spike half-width (ms)", "peak rate in song (Hz)", false, 0, 0.6, 10, 5000, p_.minWidthMs, 600.0},
+        {"##sc_sparse", "sparseness index", "song rate (Hz)", false, 0, 1, 1e-2, 300, p_.minSparseness, p_.maxSongRate}};
+
+    for (int s = 0; s < 4; ++s) {
+        if (s) ImGui::SameLine();
+        const Spec& sp = specs[s];
+        if (!ImPlot::BeginPlot(sp.id, ImVec2(w, height), ImPlotFlags_NoLegend | ImPlotFlags_NoMenus | ImPlotFlags_NoTitle)) continue;
+        ImPlot::SetupAxes(sp.xl, sp.yl);
+        if (sp.xLog) ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+        ImPlot::SetupAxisScale(ImAxis_Y1, ImPlotScale_Log10);
+        ImPlot::SetupAxisLimits(ImAxis_X1, sp.x0, sp.x1, ImPlotCond_Once);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, sp.y0, sp.y1, ImPlotCond_Once);
+
+        std::vector<double> gx, gy, bx, by, kx, ky;  // other / listed / listed and meeting every criterion
+        std::vector<int> pickUnit;
+        std::vector<double> pickX, pickY;
+        double cx = NAN, cy = NAN;
+        for (size_t i = 0; i < c.units.size(); ++i) {
+            double x = s == 0 ? logRate(c.nonSongRate[i]) : s == 3 ? c.sparseness[i] : effWidth(i);
+            const double y = s == 2 ? logRate(c.peakRate[i]) : logRate(c.songRate[i]);
+            if (!std::isfinite(y)) continue;
+            if (!std::isfinite(x)) {
+                if (s != 0) continue;
+                x = sp.x0 * 1.5;  // no non-song data: park at the left edge
+            }
+            const auto it = rowOf.find(c.units[i]);
+            const bool listed = it != rowOf.end() && !cands_[size_t(it->second)].low;
+            if (!listed) {
+                gx.push_back(x);
+                gy.push_back(y);
+            } else {
+                const bool meets = cands_[size_t(it->second)].meets;
+                (meets ? kx : bx).push_back(x);
+                (meets ? ky : by).push_back(y);
+            }
+            pickUnit.push_back(c.units[i]);
+            pickX.push_back(x);
+            pickY.push_back(y);
+            if (c.units[i] == curUnit()) {
+                cx = x;
+                cy = y;
+            }
+        }
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3, ImVec4(0.45f, 0.45f, 0.45f, 1), -1, ImVec4(0.45f, 0.45f, 0.45f, 1));
+        if (!gx.empty()) ImPlot::PlotScatter("##other", gx.data(), gy.data(), int(gx.size()));
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 4, kBlue, -1, kBlue);
+        if (!bx.empty()) ImPlot::PlotScatter("##listed", bx.data(), by.data(), int(bx.size()));
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5, kGreen, -1, kGreen);
+        if (!kx.empty()) ImPlot::PlotScatter("##meets", kx.data(), ky.data(), int(kx.size()));
+        ImPlot::SetNextLineStyle(ImVec4(0.9f, 0.7f, 0.2f, 0.6f), 1.0f);
+        ImPlot::PlotInfLines("##vx", &sp.vx, 1);
+        ImPlot::SetNextLineStyle(ImVec4(0.9f, 0.7f, 0.2f, 0.6f), 1.0f);
+        ImPlot::PlotInfLines("##hy", &sp.hy, 1, ImPlotInfLinesFlags_Horizontal);
+        if (std::isfinite(cx)) {  // the unit being viewed
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 11, ImVec4(0, 0, 0, 0), 2.5f, kRed);
+            ImPlot::PlotScatter("##cur", &cx, &cy, 1);
+            ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 4, kRed, -1, kRed);
+            ImPlot::PlotScatter("##cur2", &cx, &cy, 1);
+        }
+        if (ImPlot::IsPlotHovered()) {
+            const ImVec2 m = ImGui::GetMousePos();
+            float best = 12.0f;
+            int pick = -1;
+            for (size_t i = 0; i < pickUnit.size(); ++i) {
+                const ImVec2 p = ImPlot::PlotToPixels(pickX[i], pickY[i]);
+                const float d = std::hypot(p.x - m.x, p.y - m.y);
+                if (d < best) {
+                    best = d;
+                    pick = pickUnit[i];
+                }
+            }
+            if (pick >= 0) {
+                ImGui::SetTooltip("unit %d  (click to view)", pick);
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    const auto it = rowOf.find(pick);
+                    if (it != rowOf.end()) selectRank(it->second);
+                    else extraUnit_ = pick;
+                }
+            }
+        }
+        ImPlot::EndPlot();
+    }
 }
 
 void MsnFinderView::drawMain() {
     sync();
     drawStatus();
 
-    if (ranking_ && !ranking_->rows.empty()) {
-        const int n = int(ranking_->rows.size());
+    if (!cands_.empty()) {
+        const int n = int(cands_.size());
         // Page through units: arrow keys (when not typing) or the buttons.
         const ImGuiIO& io = ImGui::GetIO();
         if (!io.WantTextInput) {
@@ -378,16 +733,40 @@ void MsnFinderView::drawMain() {
         if (ImGui::Button("next  >")) selectRank(sel_ + 1);
         ImGui::SameLine();
         int rank = sel_ + 1;
+        char rankFmt[32];
+        std::snprintf(rankFmt, sizeof rankFmt, "rank %%d of %d", n);
         ImGui::SetNextItemWidth(14 * em());
-        if (ImGui::SliderInt("##rank", &rank, 1, n, "rank %d")) selectRank(rank - 1);
-        const MsnRankRow& r = ranking_->rows[std::clamp(sel_, 0, n - 1)];
+        if (ImGui::SliderInt("##rank", &rank, 1, n, rankFmt)) selectRank(rank - 1);
+        const Cand& c = cands_[size_t(std::clamp(sel_, 0, n - 1))];
         ImGui::SameLine();
-        ImGui::Text("of %d   unit %d   variance %.0f   %0.f spikes   (arrow keys also page)", n, r.unit, r.variance, r.nSpikes);
+        int ck = c.cls;  // classification row of the unit shown (a unit picked from a scatter need not be on the list)
+        bool meets = c.meets, low = c.low;
+        if (extraUnit_ >= 0 && cls_) {
+            ck = -1;
+            for (size_t i = 0; i < cls_->units.size(); ++i)
+                if (cls_->units[i] == extraUnit_) ck = int(i);
+            meets = false;
+            low = true;
+        }
+        if (p_.rankMode != 0 && cls_ && ck >= 0) {
+            const size_t k = size_t(ck);
+            char non[32] = "n/a";
+            if (std::isfinite(cls_->nonSongRate[k])) std::snprintf(non, sizeof non, "%.4f Hz", cls_->nonSongRate[k]);
+            ImGui::Text("unit %d   song %.2f Hz   non-song %s   width %.3f ms   sparseness %.3f   %s", cls_->units[k], cls_->songRate[k], non,
+                        effWidth(k), cls_->sparseness[k],
+                        extraUnit_ >= 0 ? "(not on the list)" : low ? "(few spikes)" : meets ? (p_.rankMode == 2 ? "sparse" : "meets all type-1 criteria") : "");
+        } else if (p_.rankMode == 0 && ranking_ && sel_ < int(ranking_->rows.size())) {
+            const MsnRankRow& r = ranking_->rows[size_t(sel_)];
+            ImGui::Text("unit %d   variance %.0f   %.0f spikes   (arrow keys also page)", r.unit, r.variance, r.nSpikes);
+        }
+    } else if (p_.rankMode != 0 && cls_) {
+        if (p_.rankMode == 2) ImGui::TextColored(kAmber, "No unit has %d or more spikes in the syllable windows.", p_.minSpikes);
+        else ImGui::TextColored(kAmber, "No unit has %d or more spikes during song at these settings.", p_.minSongSpikes);
     }
 
     const float avail = ImGui::GetContentRegionAvail().y;
-    const bool haveRank = ranking_ && !ranking_->rows.empty();
-    if (haveRank && ImGui::CollapsingHeader("Ranking table")) drawRankTable(std::min(10 * em(), avail * 0.3f));
+    if (!cands_.empty() && ImGui::CollapsingHeader("Ranking table")) drawRankTable(std::min(10 * em(), avail * 0.3f));
+    if (p_.rankMode != 0 && cls_) drawScatters(std::clamp(ImGui::GetContentRegionAvail().y * 0.26f, 9 * em(), 16 * em()));
     const float logH = showLog_ ? 7 * em() : 0;
     drawFigure(std::max(12 * em(), ImGui::GetContentRegionAvail().y - logH - 2 * em()));
 
@@ -406,13 +785,14 @@ void MsnFinderView::drawFigure(float height) {
         return;
     }
     const MsnFigure& f = *fig_;
-    const bool stale = ranking_ && !ranking_->rows.empty() &&
-                       (f.unit != ranking_->rows[std::clamp(sel_, 0, int(ranking_->rows.size()) - 1)].unit ||
-                        f.label != ranking_->label);
+    const bool stale = curUnit() >= 0 && (f.unit != curUnit() || f.label != curLabel());
 
+    char rankTxt[48];
+    if (extraUnit_ >= 0) std::snprintf(rankTxt, sizeof rankTxt, "not on the list");
+    else std::snprintf(rankTxt, sizeof rankTxt, "rank %d", sel_ + 1);
     char title[256];
-    std::snprintf(title, sizeof title, "syllable %d (n=%d, median %.0f ms)  |  unit %d  |  rank %d  |  peak %.0f ms%s", f.label,
-                  f.nRenditions, f.medianMs, f.unit, sel_ + 1, f.peakMs, stale ? "   (loading...)" : "");
+    std::snprintf(title, sizeof title, "syllable %d (n=%d, median %.0f ms)  |  unit %d  |  %s  |  peak %.0f ms%s", f.label,
+                  f.nRenditions, f.medianMs, f.unit, rankTxt,  f.peakMs, stale ? "   (loading...)" : "");
     ImGui::TextColored(stale ? kGrey : ImVec4(1, 1, 1, 1), "%s", title);
     height -= ImGui::GetTextLineHeightWithSpacing();
 
@@ -522,11 +902,25 @@ void MsnFinderView::drawFigure(float height) {
     ImGui::BeginChild("msn_right", ImVec2(0, height));
     const float hw = (height - hs) * 0.36f;
 
-    if (ImPlot::BeginPlot("##msn_wf", ImVec2(-1, hw), ImPlotFlags_NoLegend | ImPlotFlags_NoMenus)) {
-        ImPlot::SetupAxes("ms from peak deflection", "template (a.u.)", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+    if (ImPlot::BeginPlot("##msn_wf", ImVec2(-1, hw), ImPlotFlags_NoMenus)) {
+        ImPlot::SetupLegend(ImPlotLocation_SouthEast);
+        ImPlot::SetupAxes("ms from peak deflection", "normalized", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+        auto peakNormalized = [](const std::vector<float>& v) {
+            float m = 1e-12f;
+            for (float x : v) m = std::max(m, std::fabs(x));
+            std::vector<float> o(v.size());
+            for (size_t i = 0; i < v.size(); ++i) o[i] = v[i] / m;
+            return o;
+        };
         if (!f.wf.empty() && f.wfT.size() == f.wf.size()) {
+            const auto n = peakNormalized(f.wf);
+            ImPlot::SetNextLineStyle(kRed, 1.5f);
+            ImPlot::PlotLine("Kilosort template", f.wfT.data(), n.data(), int(n.size()));
+        }
+        if (!f.rawWf.empty() && f.rawT.size() == f.rawWf.size()) {
+            const auto n = peakNormalized(f.rawWf);
             ImPlot::SetNextLineStyle(ImVec4(0.9f, 0.9f, 0.9f, 1), 1.5f);
-            ImPlot::PlotLine("##wf", f.wfT.data(), f.wf.data(), int(f.wf.size()));
+            ImPlot::PlotLine("raw mean", f.rawT.data(), n.data(), int(n.size()));
         }
         ImPlot::EndPlot();
     }

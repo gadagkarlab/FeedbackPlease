@@ -433,7 +433,7 @@ given syllable. It is based on the first figure cell of the `msnFinder` notebook
    of a run decodes the syllable labels from the NI file, which can take a minute; the result is cached (set
    **Cache folder** to the notebook's `cache` folder to reuse what it already decoded).
 2. Pick a **Syllable** label. Units are ranked by the variance of their spike-time histogram (unwarped ms from
-   onset to the median syllable duration; *Histogram bins*, *Min spikes*, *Show lowest-variance units* as in the
+   onset to the median syllable duration; *Histogram bins*, *Min spikes* as in the
    notebook), lowest first.
 3. Page through the units with **prev / next**, the slider, the arrow keys or the ranking table. Each unit shows
    the mean spectrogram, the syllable-aligned raster (median end and interquartile range in red; the gray band is
@@ -469,3 +469,47 @@ generated after each one plays, so every trigger is different, and the next one 
 - **Test pulse feedback** in the toolbar plays a burst without the input, to check the speaker and levels.
 - Settings are applied at Start (the digital input and the AO waveform are built then).
 - The Closed loop tab's **Digital line** is a SpikeGLX NI output; it only reaches this input through your wiring.
+
+### MSN finder: ranking by type-1 likeness
+
+**Rank by > Type-1 likeness** ranks units by how much they look like the medium spiny neurons ("type 1") of
+[Goldberg & Fee 2010](https://pmc.ncbi.nlm.nih.gov/articles/PMC2853292) instead of by histogram variance. The
+paper's criteria: mean rate during song under 10 Hz, essentially silent outside song (under 0.01 Hz) and a wide
+spike (half-width of the negative deflection over 0.06 ms). The thresholds are editable in the left panel.
+
+- **Song vs non-song** comes from the sound-pulse digital line (high while the mic is over threshold, line 4):
+  pulses closer than *Bout gap* are joined into a song bout; non-song time is further than *Non-song margin* from
+  every bout (the paper uses 10 s). Rates are time averages of the instantaneous rate (1 / the enclosing
+  inter-spike interval), as in the paper. If a run has little or no such time the panel says so and the
+  outside-song criterion is unreliable or skipped. (The Choc57 d2.0 run has sound within 18 s of every moment,
+  so the paper's 10 s margin leaves no non-song time at all.)
+- **Spike width** is the interpolated half-width of the unit's dominant deflection (a peak-dominant unit is flipped
+  and marked "(+)" in the table). **Width from** chooses the source: the Kilosort template of the peak channel, or
+  the **mean raw waveform**: press *Measure raw waveforms* (about a minute for ~160 units) to average up to
+  *Spikes per unit* random spikes of each unit from the .ap.bin. The raw data is 30 kHz, so each snippet is
+  upsampled 8x and aligned on its own trough (or peak) before averaging, which removes timing jitter; the figure
+  overlays the raw mean on the template. On Choc57 d2.0 the two agree well (r = 0.81, median 0.15-0.16 ms), and every
+  unit is wider than the paper's 0.06 ms, so check the scatter before choosing a cut.
+- **Ranking:** each unit's score is how many decades it is from meeting the worst criterion (0 or below = meets all;
+  lower is clearer). Units with fewer than *Min spikes in song* spikes in song are not listed.
+- **Scatters** (the paper's Fig. 1D-F plus sparseness): song vs non-song rate, song rate vs width, peak song rate vs width, song rate vs sparseness. Gray =
+  a unit that fails the spike-count criteria, blue = ranked, green = meets every criterion, red circle = the unit being viewed; click any
+  point (gray ones too) to view that unit. Yellow lines are the thresholds (600 Hz on the third plot separates the paper's types 3
+  and 4). Rates of exactly 0 are drawn at 3e-4 Hz on the log axes.
+- The per-unit figure below is for the chosen **Syllable**, as before; page with prev / next, the slider, the arrow
+  keys or the ranking table.
+
+All units that pass the spike-count criteria are listed (there is no cap): page through the whole ranking with
+prev / next, the slider ("rank k of N") or the arrow keys. **Include low-spike units** (type-1 and sparseness modes)
+also lists the ones that fail them, grey and after the ranked ones; with it off, a grey dot in a scatter can still
+be clicked to view that unit ("not on the list").
+
+### MSN finder: ranking by sparseness
+
+**Rank by > Sparseness (paper)** ranks units by the paper's sparseness index, most sparse first. For each unit the
+syllable-aligned rate histograms (10 ms bins, mean spikes per rendition, onset to the median duration) of every
+syllable label with 30 or more renditions are joined and normalized to a probability vector p over all N bins;
+index = 1 + sum(p log p) / log N. 1 means all activity in one bin, 0 means spread evenly. The paper reports 0.45
++- 0.14 for type-1 cells and about 0.02 for types 2-4. Units with fewer than *Min spikes* spikes in those windows
+are not ranked (the index is meaningless on a handful of spikes). *Sparse above* only colors units green in the
+scatters. On Choc57 d2.0 the median is 0.025 and the top units reach 0.4-0.8.
