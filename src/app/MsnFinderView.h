@@ -4,6 +4,7 @@
 // (mean spectrogram, syllable-aligned raster, spikes-in-window per rendition, template, probe position).
 // Figures are drawn live and never saved.
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,11 @@ private:
     void drawRankTable(float height);
     void drawFigure(float height);
     void selectRank(int r);
+    void rebuildCandidates();
+    double effWidth(size_t i) const;  // spike width of classification entry i, from the chosen source
+    int curUnit() const;   // unit being viewed, -1 if none
+    int curLabel() const;  // syllable label of the figure, -1 if none
+    void drawScatters(float height);
     void prepareSpec(const MsnSpec& s);
 
     MsnParams p_;
@@ -50,7 +56,24 @@ private:
     std::shared_ptr<const MsnSession> session_;
     std::shared_ptr<const MsnRanking> ranking_;
     std::shared_ptr<const MsnFigure> fig_;
+    std::shared_ptr<const MsnClassification> cls_;
+    uint64_t seenClass_ = 0;
+    std::shared_ptr<const MsnRawWidths> raw_;
+    uint64_t seenRaw_ = 0;
+    std::map<int, size_t> rawIndex_;  // unit -> position in raw_
     int sel_ = 0;                     // index into ranking_->rows
+    // The units to page through, best first, for the current ranking mode.
+    struct Cand {
+        int unit = 0;
+        double score = 0;  // variance, or type-1 violation (<= 0: meets every criterion)
+        int cls = -1;      // index into cls_ (type-1 and sparseness modes)
+        bool meets = false;  // meets every type-1 criterion (type-1 mode) / the sparseness threshold (sparseness mode)
+        bool low = false;    // fails the spike-count criteria (only listed when "Include low-spike units" is on)
+    };
+    std::vector<Cand> cands_;
+    std::string candKey_;  // what cands_ was built from
+    int selUnit_ = -1;     // keeps the selection on the same unit when the list is rebuilt
+    int extraUnit_ = -1;   // a unit viewed from a scatter that is not on the list (-1: none)
     int reqLabel_ = -1, reqUnit_ = -1;
     double reqPad_ = -1;              // what the last figure request asked for
 

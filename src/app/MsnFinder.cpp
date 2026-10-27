@@ -188,6 +188,8 @@ MSN_GETTER(MsnSession, session, session_)
 MSN_GETTER(MsnRanking, ranking, ranking_)
 MSN_GETTER(MsnSpec, spec, spec_)
 MSN_GETTER(MsnFigure, figure, figure_)
+MSN_GETTER(MsnClassification, classification, class_)
+MSN_GETTER(MsnRawWidths, rawWidths, raw_)
 #undef MSN_GETTER
 
 // ---------------------------------------------------------------------------------------------
@@ -355,12 +357,22 @@ bool MsnBackend::requestLoad(const MsnParams& p, std::string& err) {
                 pend, err);
 }
 
-bool MsnBackend::requestRank(int label, int nbins, int minSpikes, int nUnits, std::string& err) {
+bool MsnBackend::requestRank(int label, int nbins, int minSpikes, std::string& err) {
     Pending pend{Pending::Rank};
     pend.label = label;
     return send("RANK\t" + std::to_string(label) + "\t" + std::to_string(std::max(2, nbins)) + "\t" +
-                    std::to_string(std::max(0, minSpikes)) + "\t" + std::to_string(std::max(0, nUnits)),
+                    std::to_string(std::max(0, minSpikes)) + "\t0",
                 pend, err);
+}
+
+bool MsnBackend::requestClassify(double boutGapS, double nonSongMarginS, std::string& err) {
+    Pending pend{Pending::Classify};
+    return send("CLASSIFY	" + num(std::max(0.0, boutGapS)) + "	" + num(std::max(0.0, nonSongMarginS)), pend, err);
+}
+
+bool MsnBackend::requestRawWidths(int nSpikes, std::string& err) {
+    Pending pend{Pending::RawWf};
+    return send("RAWWF	" + std::to_string(std::clamp(nSpikes, 10, 2000)), pend, err);
 }
 
 bool MsnBackend::requestFigure(int label, int unit, double pad, std::string& err) {
@@ -452,13 +464,58 @@ void MsnBackend::finish(const MsnResponse& r, bool ok, const std::string& msg) {
             ranking_.reset();
             spec_.reset();
             figure_.reset();
+            class_.reset();
+            raw_.reset();
             specSent_ = false;
             specLabel_ = -1;
         }
         ++sessionVer_;
         ++rankingVer_;
         ++figureVer_;
+        ++classVer_;
+        ++rawVer_;
         log("Session " + s->name + ": " + std::to_string(s->nUnits) + " units, " + std::to_string(s->labels.size()) + " syllable labels");
+    } else if (pend.kind == Pending::RawWf) {
+        auto w = std::make_shared<MsnRawWidths>();
+        w->units = r.i32("raw_units");
+        w->widthMs = r.f64("raw_width_ms");
+        w->polarity = r.f64("raw_polarity");
+        w->nSpikes = r.f64("raw_n");
+        w->widthMs.resize(w->units.size(), NAN);
+        w->polarity.resize(w->units.size(), 0.0);
+        w->nSpikes.resize(w->units.size(), 0.0);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            raw_ = w;
+        }
+        ++rawVer_;
+        log("Raw waveform widths ready for " + std::to_string(w->units.size()) + " units");
+    } else if (pend.kind == Pending::Classify) {
+        auto c = std::make_shared<MsnClassification>();
+        c->nBouts = static_cast<int>(r.num("n_bouts"));
+        c->songSec = r.num("song_s");
+        c->nonSongSec = r.num("nonsong_s");
+        c->units = r.i32("cls_units");
+        c->songRate = r.f64("cls_song_rate");
+        c->nonSongRate = r.f64("cls_nonsong_rate");
+        c->widthMs = r.f64("cls_width_ms");
+        c->peakRate = r.f64("cls_peak_rate");
+        c->nSong = r.f64("cls_n_song");
+        c->nNonSong = r.f64("cls_n_nonsong");
+        c->polarity = r.f64("cls_polarity");
+        c->sparseness = r.f64("cls_sparseness");
+        c->sparseN = r.f64("cls_sparse_n");
+        const size_t n = c->units.size();
+        for (auto* v : {&c->songRate, &c->nonSongRate, &c->widthMs, &c->peakRate, &c->nSong, &c->nNonSong, &c->polarity, &c->sparseness,
+                        &c->sparseN})
+            v->resize(n, NAN);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            class_ = c;
+        }
+        ++classVer_;
+        log("Classified " + std::to_string(n) + " units: " + std::to_string(c->nBouts) + " song bouts (" + num(c->songSec) + " s), " +
+            num(c->nonSongSec) + " s non-song");
     } else if (pend.kind == Pending::Rank) {
         auto rk = std::make_shared<MsnRanking>();
         rk->label = pend.label;
@@ -495,6 +552,10 @@ void MsnBackend::finish(const MsnResponse& r, bool ok, const std::string& msg) {
         f->spikeRendition = r.i32("spike_rendition");
         f->wfT = r.f32("wf_t_ms");
         f->wf = r.f32("wf");
+        f->rawT = r.f32("raw_t_ms");
+        f->rawWf = r.f32("raw_wf");
+        f->rawWidthMs = r.num("raw_width_ms", NAN);
+        f->rawN = static_cast<int>(r.num("raw_n"));
         f->fpXY = r.f32("fp_xy");
         f->fpShank = r.i32("fp_shank");
         f->fpAmp = r.f32("fp_amp");
