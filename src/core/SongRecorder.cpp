@@ -115,6 +115,16 @@ void SongFileWriter::endFile() {
     ++filesDone_;
 }
 
+void SongFileWriter::skip(uint64_t n) {
+    if (!open_ || n == 0) return;
+    if (recording_) {
+        frame_.clear();  // the last frame written is already counted in sample_
+        endFile();
+    }
+    ringHead_ = ringCount_ = 0;  // the pre-roll before the gap doesn't belong to what comes after
+    sample_ += n;
+}
+
 void SongFileWriter::close() {
     if (!open_) return;
     if (recording_) {

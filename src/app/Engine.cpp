@@ -145,13 +145,29 @@ void Engine::run(Runner& r) {
     --alive_;
 }
 
-void Engine::stop() {
+void Engine::requestStop() {
+    if (stopper_.joinable()) return;  // already stopping (or stopped, not yet collected)
     stop_ = true;
+    stopping_ = true;
+    stopper_ = std::thread([this] {
+        finishStop();
+        stopping_ = false;
+    });
+}
+
+void Engine::stop() {
+    requestStop();
+    if (stopper_.joinable()) stopper_.join();
+}
+
+void Engine::finishStop() {
     for (auto& r : runners_)
         if (r->th.joinable()) r->th.join();
     for (auto& r : runners_) r->src->stop();
     runners_.clear();
-    for (auto& b : boxes_) b->end();  // boxes stay, so the GUI can still show their last state
+    // Boxes stay, so the GUI can still show their last state. Closing finishes any audio
+    // still queued for writing, which is why this runs off the GUI thread.
+    for (auto& b : boxes_) b->end();
     alive_ = 0;
 }
 

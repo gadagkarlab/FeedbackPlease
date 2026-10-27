@@ -195,7 +195,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
+    // No vsync: the frame cap in the loop paces redraws with a real sleep. With vsync on,
+    // NVIDIA's OpenGL driver waits for each refresh by spinning, so the GUI thread used a
+    // full CPU core while idle (and vsync doesn't throttle at all when the screen is off).
+    glfwSwapInterval(0);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -223,6 +226,16 @@ int main(int argc, char** argv) {
         if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) {
             glfwWaitEventsTimeout(0.1);
             continue;
+        }
+        // Cap the redraw rate ourselves: vsync stops throttling OpenGL when the monitor is off,
+        // the screen is locked or over Remote Desktop, and the loop would then redraw thousands
+        // of times a second all night through the graphics driver. 60 fps in front, 15 behind.
+        {
+            static double lastFrame = 0.0;
+            const double minGap = glfwGetWindowAttrib(window, GLFW_FOCUSED) ? 1.0 / 60.0 : 1.0 / 15.0;
+            const double wait = lastFrame + minGap - glfwGetTime();
+            if (wait > 0.0) glfwWaitEventsTimeout(wait);  // input still wakes it, so typing stays snappy
+            lastFrame = glfwGetTime();
         }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();

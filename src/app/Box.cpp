@@ -44,6 +44,11 @@ bool AsyncRecorder::open(const std::string& envPath, double envRate, const std::
     if (events_.is_open()) events_ << "sample,time_ms,event,value,detail\n";
     eventsOn_ = events_.is_open();
     songsOn_ = songs != nullptr;
+    songFs_ = songs ? songs->sampleRate : 0.0;
+    maxMic_ = size_t(kMaxQueueSec * songFs_);
+    maxEnv_ = size_t(kMaxQueueSec * envRate);
+    pendSkip_ = 0;
+    dropped_ = 0;
     frameN_ = 0;
     envOn_ = env_.isOpen();
     if (!envOn_ && !eventsOn_ && !songsOn_) return true;
@@ -55,13 +60,20 @@ bool AsyncRecorder::open(const std::string& envPath, double envRate, const std::
 void AsyncRecorder::pushEventLine(std::string line) {
     if (!eventsOn_) return;
     std::lock_guard<std::mutex> lk(mx_);
-    pendLines_.push_back(std::move(line));
+    if (pendLines_.size() < 200000) pendLines_.push_back(std::move(line));  // bounded like the audio
 }
 
 void AsyncRecorder::pushFrame(const float* mic, int n, float detection, float marker, bool song) {
     if (!songsOn_) return;
     std::lock_guard<std::mutex> lk(mx_);
     frameN_ = n;  // constant for a run
+    // The writer is far behind (slow or unreachable disk, or starved of CPU): drop this frame
+    // rather than queue without limit. The writer is told, so song files end at the gap.
+    if (pendMic_.size() + size_t(n) > maxMic_) {
+        pendSkip_ += uint64_t(n);
+        dropped_ += uint64_t(n);
+        return;
+    }
     pendMic_.insert(pendMic_.end(), mic, mic + n);
     pendMeta_.push_back({detection, marker, song});
 }
@@ -69,7 +81,7 @@ void AsyncRecorder::pushFrame(const float* mic, int n, float detection, float ma
 void AsyncRecorder::pushEnv(float v) {
     if (!envOn_) return;  // flag, not env_.isOpen(): env_ belongs to the writer thread
     std::lock_guard<std::mutex> lk(mx_);
-    pendEnv_.push_back(v);
+    if (pendEnv_.size() < maxEnv_) pendEnv_.push_back(v);
 }
 
 void AsyncRecorder::run() {
@@ -79,6 +91,7 @@ void AsyncRecorder::run() {
     for (;;) {
         bool done;
         int n;
+        uint64_t skip;
         {
             std::unique_lock<std::mutex> lk(mx_);
             cv_.wait_for(lk, std::chrono::milliseconds(100), [&] { return stop_; });
@@ -87,12 +100,15 @@ void AsyncRecorder::run() {
             meta.swap(pendMeta_);
             e.swap(pendEnv_);
             lines.swap(pendLines_);
+            skip = pendSkip_;
+            pendSkip_ = 0;
             n = frameN_;
             done = stop_;
         }
         // Song files: pre-roll ring + start/extend/end decisions, frame by frame.
         for (size_t f = 0; f < meta.size() && n > 0; ++f)
             songs_.push(&mic[f * size_t(n)], n, meta[f].detection, meta[f].marker, meta[f].song);
+        songs_.skip(skip);  // frames dropped after these (the queue was full)
         env_.write(e.data(), e.size());
         for (const auto& l : lines) events_ << l << '\n';
         if (!lines.empty()) events_.flush();  // a crash loses at most ~100 ms of events
@@ -117,10 +133,18 @@ void AsyncRecorder::close() {
     env_.close();
     if (events_.is_open()) events_.close();
     eventsOn_ = songsOn_ = envOn_ = false;
-    pendMic_.clear();
-    pendMeta_.clear();
-    pendEnv_.clear();
-    pendLines_.clear();
+    // Give the memory back (clear() would keep it): boxes stay alive after Stop.
+    std::vector<float>().swap(pendMic_);
+    std::vector<FrameMeta>().swap(pendMeta_);
+    std::vector<float>().swap(pendEnv_);
+    std::vector<std::string>().swap(pendLines_);
+    pendSkip_ = 0;
+}
+
+double AsyncRecorder::queuedSec() {
+    if (songFs_ <= 0) return 0.0;
+    std::lock_guard<std::mutex> lk(mx_);
+    return double(pendMic_.size()) / songFs_;
 }
 
 
@@ -153,6 +177,8 @@ bool Box::begin(const AppParams& p, const std::string& backend, std::string& err
     pulseLastMs_ = -1e12;
     songBouts_ = 0;
     codeCounts_.clear();
+    loggedDropSec_ = 0.0;
+    lastDropLogMs_ = -1e18;
     countedCodes_.clear();
     codeUnmatched_ = 0;
     codeOut_ = 0;
@@ -441,6 +467,15 @@ void Box::process(const float* x, int n, IOBackend& io, size_t backlogSamples) {
         ++suppressed_;
         logEvent(t, "suppressed", fmt("feedback %.0f below detect-signal threshold", r.fb.suppressed), r.value);
     }
+    // Recording fell behind and audio was dropped (at most one message every 10 s).
+    const double droppedSec = recorder_.droppedSec();
+    if (droppedSec > loggedDropSec_ && t - lastDropLogMs_ >= 10000.0) {
+        logEvent(t, "error",
+                 fmt("recording fell behind: %.1f s of audio dropped so far (disk too slow or CPU starved)", droppedSec),
+                 0.0);
+        loggedDropSec_ = droppedSec;
+        lastDropLogMs_ = t;
+    }
     const std::string outErr = io.takeOutputError();
     if (!outErr.empty()) logEvent(t, "error", outErr, 0.0);
 
@@ -487,6 +522,8 @@ void Box::process(const float* x, int n, IOBackend& io, size_t backlogSamples) {
     s.blocked = blocked_;
     s.songFilesDone = recorder_.songFilesDone();
     s.songFileOpen = recorder_.songRecording();
+    s.recQueueSec = recorder_.queuedSec();
+    s.recDroppedSec = recorder_.droppedSec();
     s.currentCode = codeOut_;
     s.codeCounts = codeCounts_;
     s.codeUnmatched = codeUnmatched_;

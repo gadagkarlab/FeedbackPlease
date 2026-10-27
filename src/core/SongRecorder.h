@@ -37,6 +37,9 @@ public:
     // One frame: n microphone samples plus the frame's detection value, marker level
     // and whether the song detector is on.
     void push(const float* mic, int n, float detection, float marker, bool song);
+    // n samples are missing from the stream (the recorder fell behind and dropped them):
+    // the file in progress ends at the gap and the clock moves on.
+    void skip(uint64_t n);
     void close();  // finishes a file in progress
 
     int channels() const { return ch_; }

@@ -50,6 +50,8 @@ struct EngineStats {
     bool pulseInput = false;                  // pulse input line is high now
     int songFilesDone = 0;      // song-triggered WAVs finished this session
     bool songFileOpen = false;  // a song-triggered WAV is being written now
+    double recQueueSec = 0.0;    // audio waiting to be written
+    double recDroppedSec = 0.0;  // audio dropped because writing fell too far behind
     int currentCode = 0;               // value on the syllable code port now
     std::vector<uint64_t> codeCounts;   // per entry of the syllable code list ("All Sylls Count")
     uint64_t codeUnmatched = 0;         // IOI ends where no entry matched
@@ -93,6 +95,11 @@ public:
     bool eventsOpen() const { return eventsOn_; }
     int songFilesDone() const { return songs_.filesDone(); }
     bool songRecording() const { return songs_.recording(); }
+    // Audio waiting for the writer thread, and audio dropped because the writer fell more
+    // than kMaxQueueSec behind (instead of letting the queue eat all memory), in seconds.
+    double queuedSec();
+    double droppedSec() const { return songFs_ > 0 ? double(dropped_.load()) / songFs_ : 0.0; }
+    static constexpr double kMaxQueueSec = 30.0;
     void close();
 
 private:
@@ -113,6 +120,10 @@ private:
     std::vector<float> pendMic_, pendEnv_;
     std::vector<FrameMeta> pendMeta_;
     std::vector<std::string> pendLines_;
+    uint64_t pendSkip_ = 0;           // samples dropped since the writer last took the queue
+    size_t maxMic_ = 0, maxEnv_ = 0;  // queue limits: kMaxQueueSec of audio / envelope
+    double songFs_ = 0.0;
+    std::atomic<uint64_t> dropped_{0};  // samples dropped this session
     bool stop_ = false;
     std::thread th_;
 };
@@ -191,6 +202,7 @@ private:
     double pulseLastMs_ = -1e12;
     uint64_t songBouts_ = 0;
     std::vector<uint64_t> codeCounts_;
+    double loggedDropSec_ = 0.0, lastDropLogMs_ = -1e18;  // recording-drop messages
     std::vector<int> countedCodes_;  // codes of the list the counts belong to
     uint64_t codeUnmatched_ = 0;
     int codeOut_ = 0;  // value currently on the syllable code port

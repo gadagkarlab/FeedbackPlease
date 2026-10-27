@@ -159,7 +159,7 @@ if(FP_BUILD_GUI)
     message(WARNING "Closed loop tab disabled: SpikeGLX SDK not found in ${SGLX_SDK_DIR}. Set SGLX_SDK_DIR.")
   endif()
   if(WIN32)
-    target_link_libraries(FeedbackPlease PRIVATE winmm comdlg32 dbghelp shell32 ole32)
+    target_link_libraries(FeedbackPlease PRIVATE winmm comdlg32 dbghelp shell32 ole32 psapi)
   endif()
   if(MSVC)
     # Keep symbols in Release so crash traces have function names and line numbers.

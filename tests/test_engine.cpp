@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <vector>
 #include <thread>
 
 #include "app/Engine.h"
@@ -118,6 +120,59 @@ int main() {
         failIf(s[1].matches != 0 || s[1].fires1 != 0, "multi: box B (no target) gave feedback");
         failIf(s[2].matches < 2 || s[2].fires1 != 0, "multi: box C (feedback off) gave feedback");
         failIf(!e.error().empty(), "multi engine error");
+    }
+
+    // ---- stopping returns at once; the boxes finish their files in the background
+    {
+        std::vector<AppParams> boxes(2, p);
+        for (int i = 0; i < 2; ++i) {
+            boxes[size_t(i)].boxName = "Stop " + std::to_string(i);
+            boxes[size_t(i)].birdName = "stoptest" + std::to_string(i);
+            boxes[size_t(i)].rec.outputDir = "fp_stop_test";
+            boxes[size_t(i)].rec.saveEvents = true;
+            boxes[size_t(i)].rec.songFiles = true;
+        }
+        Engine e;
+        std::string err;
+        failIf(!e.start(boxes, false, err), "stop test: start");
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        const auto t0 = std::chrono::steady_clock::now();
+        e.requestStop();
+        const double callMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        while (e.stopping() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const double doneMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("stop: requestStop returned in %.2f ms, files finished after %.0f ms\n", callMs, doneMs);
+        failIf(callMs > 50.0, "requestStop blocked");
+        failIf(e.stopping() || e.running(), "engine did not finish stopping");
+        e.stop();  // collects the stopper thread
+        std::filesystem::remove_all("fp_stop_test");
+    }
+
+    // ---- recording that can't keep up: the queue must stay bounded (memory), not grow forever
+    {
+        const std::string dir = "fp_rec_flood";
+        SongFileConfig sc;
+        sc.indexPath = dir + "_songs.csv";
+        sc.birdDir = dir;
+        sc.bird = "flood";
+        sc.sampleRate = 40000.0;
+        AsyncRecorder rec;
+        std::string err;
+        failIf(!rec.open("", 1000.0, "", &sc, &err), "recorder open");
+        // 10 minutes of song pushed as fast as possible: far faster than the writer drains it.
+        std::vector<float> frame(40, 0.01f);
+        double maxQueued = 0.0;
+        for (int f = 0; f < 600000; ++f) {
+            rec.pushFrame(frame.data(), 40, 0.5f, 0.1f, true);
+            if ((f & 4095) == 0) maxQueued = std::max(maxQueued, rec.queuedSec());
+        }
+        std::printf("recorder flood: max queued %.1f s, dropped %.1f s of 600 s\n", maxQueued, rec.droppedSec());
+        failIf(maxQueued > AsyncRecorder::kMaxQueueSec + 0.1, "recorder queue exceeded its limit");
+        failIf(rec.droppedSec() <= 0.0, "recorder did not report dropped audio");
+        rec.close();
+        std::remove(sc.indexPath.c_str());
+        std::filesystem::remove_all(dir);
     }
 
     std::printf(fails ? "Engine test FAILED\n" : "Engine test passed\n");

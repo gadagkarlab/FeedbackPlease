@@ -27,7 +27,11 @@ public:
     // their AI channel (one AI / DO / streaming-AO task per card); simulated boxes
     // each run on their own simulated source.
     bool start(const std::vector<AppParams>& boxes, bool single, std::string& err);
-    void stop();
+    void stop();  // blocks until every box has finished writing its files
+    // Stops acquisition now and finishes the files on a background thread, so the GUI
+    // stays responsive however much a box still has to write. See stopping().
+    void requestStop();
+    bool stopping() const { return stopping_.load(); }
     bool running() const { return alive_.load() > 0; }
 
     int boxCount() const { return int(boxes_.size()); }
@@ -42,11 +46,14 @@ private:
         std::thread th;
     };
     void run(Runner& r);
+    void finishStop();  // joins the threads and closes the boxes' files
 
     std::vector<std::unique_ptr<Box>> boxes_;
     std::vector<std::unique_ptr<Runner>> runners_;
     std::atomic<bool> stop_{false};
     std::atomic<int> alive_{0};  // runner threads still running
+    std::atomic<bool> stopping_{false};
+    std::thread stopper_;
 };
 
 }  // namespace fp

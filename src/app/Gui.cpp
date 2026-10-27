@@ -6,6 +6,17 @@
 #include <filesystem>
 #include <fstream>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 #include "app/Widgets.h"
 #include "core/NoiseBurst.h"
 #include "imgui.h"
@@ -328,14 +339,20 @@ void Gui::drawToolbar() {
 
     ImGui::PushStyleColor(ImGuiCol_Button, running ? ImVec4(0.65f, 0.15f, 0.15f, 1) : ImVec4(0.15f, 0.5f, 0.2f, 1));
     const char* startLabel = mode_ == AppMode::Multi ? (running ? " Stop all " : " Start all ") : (running ? "  Stop  " : "  Start  ");
+    // Stopping finishes the boxes' files in the background; Start waits until that's done.
+    const bool stopping = engine_.stopping();
+    if (stopping) status_ = "Stopping: finishing recordings...";
+    else if (status_.rfind("Stopping", 0) == 0) status_ = "Stopped";
+    ImGui::BeginDisabled(stopping && !running);
     if (ImGui::Button(startLabel, ImVec2(6.5f * em(), 0))) {
         if (running) {
-            engine_.stop();
-            status_ = "Stopped";
+            engine_.requestStop();
+            status_ = "Stopping: finishing recordings...";
         } else {
             startEngine();
         }
     }
+    ImGui::EndDisabled();
     ImGui::PopStyleColor();
 
     ImGui::SameLine();
@@ -439,6 +456,22 @@ void Gui::drawToolbar() {
     ImGui::SameLine();
     const bool bad = status_.find("fail") != std::string::npos || status_.rfind("Stopped:", 0) == 0;
     ImGui::TextColored(bad ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "%s", status_.c_str());
+#ifdef _WIN32
+    // Memory in use by the app (checked twice a second): should stay flat during a long run.
+    static double memMb = 0.0, memAt = -1.0;
+    if (ImGui::GetTime() - memAt > 0.5) {
+        PROCESS_MEMORY_COUNTERS pmc{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) memMb = double(pmc.PagefileUsage) / 1048576.0;
+        memAt = ImGui::GetTime();
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(memMb > 2048.0 ? kRed : ImVec4(0.5f, 0.5f, 0.5f, 1), "| mem %.0f MB  %.0f fps", memMb,
+                       ImGui::GetIO().Framerate);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Memory used by FeedbackPlease, and how often the window redraws (at most 60 per second, 15 when "
+                          "it is not in front). Memory should stay roughly constant while recording; if it keeps "
+                          "growing, check each box's 'rec queue'.");
+#endif
 }
 
 // Multi-box: pick / add / remove / name the box shown in the panel below.
@@ -512,13 +545,13 @@ void Gui::drawBirdName() {
 void Gui::drawOverview() {
     const float rowH = ImGui::GetTextLineHeightWithSpacing();
     const float h = std::min(ImGui::GetContentRegionAvail().y * 0.35f, rowH * float(boxes_.size() + 2));
-    if (!ImGui::BeginTable("boxes", 11,
+    if (!ImGui::BeginTable("boxes", 12,
                            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_ScrollY |
                                ImGuiTableFlags_SizingStretchProp,
                            ImVec2(0, h)))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
-    for (const char* c : {"box", "bird", "state", "mic", "song", "onsets", "target", "feedback", "code", "backlog", "error"})
+    for (const char* c : {"box", "bird", "state", "mic", "song", "onsets", "target", "feedback", "code", "backlog", "rec queue", "error"})
         ImGui::TableSetupColumn(c);
     ImGui::TableHeadersRow();
     for (int i = 0; i < int(boxes_.size()); ++i) {
@@ -555,6 +588,11 @@ void Gui::drawOverview() {
         ImGui::Text("%d", s.currentCode);
         ImGui::TableNextColumn();
         ImGui::Text("%.1f ms", s.backlogMs);
+        ImGui::TableNextColumn();
+        if (s.recDroppedSec > 0.0)
+            ImGui::TextColored(kRed, "%.1f s, %.0f s dropped", s.recQueueSec, s.recDroppedSec);
+        else
+            ImGui::TextColored(s.recQueueSec > 2.0 ? kRed : ImGui::GetStyleColorVec4(ImGuiCol_Text), "%.1f s", s.recQueueSec);
         ImGui::TableNextColumn();
         if (!e.empty()) ImGui::TextColored(kRed, "%s", e.c_str());
     }
@@ -1363,6 +1401,15 @@ void Gui::drawStatus() {
     const bool lagging = s.backlogMs > 5.0 * s.frameSamples * 1000.0 / s.sampleRate;
     ImGui::TextColored(lagging ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "|  backlog %.1f ms (max %.1f)  proc %.0f us (max %.0f)",
                        s.backlogMs, s.maxBacklogMs, s.procUsAvg, s.procUsMax);
+    // Audio waiting to be written to disk; it should stay well under a second.
+    const bool recBehind = s.recQueueSec > 2.0 || s.recDroppedSec > 0.0;
+    ImGui::SameLine();
+    ImGui::TextColored(recBehind ? kRed : ImVec4(0.7f, 0.7f, 0.7f, 1), "| rec queue %.1f s%s", s.recQueueSec,
+                       s.recDroppedSec > 0.0 ? "  DROPPED AUDIO" : "");
+    if (s.recDroppedSec > 0.0 && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%.1f s of audio could not be written in time and was dropped (the disk was too slow or "
+                          "unreachable, or the computer was too busy). Song files end at each gap.",
+                          s.recDroppedSec);
 
     ImGui::TextColored(stateColor(s.fbState), "%-18s", toString(s.fbState));
     ImGui::SameLine();
