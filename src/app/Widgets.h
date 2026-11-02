@@ -38,10 +38,12 @@ bool EnumCombo(const char* label, E* v, int count, float widthEm = 10.0f) {
     return r;
 }
 
-// Native dialogs (Windows); return "" when cancelled or unsupported.
-std::string openFileDialog(const char* filter);
-std::string saveFileDialog(const char* filter, const char* defaultExt);
-std::string pickFolderDialog(const char* title);
+// Native dialogs (the standard Windows Explorer-style ones); return "" when cancelled or
+// unsupported. filter: "Name\0*.ext\0Name\0*.*\0" pairs. start: a file or folder to open
+// at (its folder is used for a file; ignored if it doesn't exist). Paths are UTF-8.
+std::string openFileDialog(const char* filter, const std::string& start = {});
+std::string saveFileDialog(const char* filter, const char* defaultExt, const std::string& start = {});
+std::string pickFolderDialog(const char* title, const std::string& start = {});
 
 // Min/max decimation so long traces draw as ~2 points per pixel column.
 // x of sample i = x0 + i / rate.

@@ -122,9 +122,9 @@ void MsnFinderView::drawParams() {
         ImGui::SameLine();
         if (ImGui::Button("...")) {
             std::string f;
-            if (kind == 0) f = pickFolderDialog("Select folder");
-            else if (kind == 1) f = openFileDialog("Programs (*.exe)\0*.exe\0All files\0*.*\0");
-            else f = openFileDialog("Python scripts (*.py)\0*.py\0All files\0*.*\0");
+            if (kind == 0) f = pickFolderDialog("Select folder", *s);
+            else if (kind == 1) f = openFileDialog("Programs (*.exe)\0*.exe\0All files\0*.*\0", *s);
+            else f = openFileDialog("Python scripts (*.py)\0*.py\0All files\0*.*\0", *s);
             if (!f.empty()) *s = f;
         }
         ImGui::SameLine();

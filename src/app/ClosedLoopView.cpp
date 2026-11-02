@@ -40,9 +40,9 @@ bool pathField(const char* label, std::string* s, PathKind kind, const char* fil
     ImGui::SameLine();
     if (ImGui::Button("...")) {
         std::string f;
-        if (kind == PathKind::Folder) f = pickFolderDialog("Select folder");
-        else if (kind == PathKind::SaveFile) f = saveFileDialog(filter, "txt");
-        else f = openFileDialog(filter);
+        if (kind == PathKind::Folder) f = pickFolderDialog("Select folder", *s);
+        else if (kind == PathKind::SaveFile) f = saveFileDialog(filter, "txt", *s);
+        else f = openFileDialog(filter, *s);
         if (!f.empty()) {
             *s = f;
             r = true;

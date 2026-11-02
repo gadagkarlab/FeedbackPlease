@@ -400,7 +400,7 @@ void Gui::drawToolbar() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Save as...")) {
-        const std::string f = saveFileDialog(iniFilter, "ini");
+        const std::string f = saveFileDialog(iniFilter, "ini", settingsPath_);
         std::string e;
         if (!f.empty()) {
             if (saveSettings(f, &e)) {
@@ -415,7 +415,7 @@ void Gui::drawToolbar() {
     ImGui::SameLine();
     ImGui::BeginDisabled(running);
     if (ImGui::Button("Load...")) {
-        const std::string f = openFileDialog(iniFilter);
+        const std::string f = openFileDialog(iniFilter, settingsPath_);
         if (!f.empty()) {
             std::string e;
             if (loadSettings(f, &e)) {
@@ -1325,7 +1325,7 @@ void Gui::drawRecording() {
     InputStr("##outdir", &r.outputDir, 12);
     ImGui::SameLine();
     if (ImGui::Button("...##outdir")) {
-        const std::string f = pickFolderDialog("Recording output folder");
+        const std::string f = pickFolderDialog("Recording output folder", r.outputDir);
         if (!f.empty()) {
             r.outputDir = f;
             changed() = true;

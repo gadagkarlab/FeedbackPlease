@@ -705,7 +705,7 @@ void TuneView::drawBrowser(AppParams& p) {
     const bool enter = ImGui::InputText("##folder", &folder_, ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
     if (ImGui::Button("Browse...")) {
-        const std::string f = pickFolderDialog("Folder of WAV files to tune on");
+        const std::string f = pickFolderDialog("Folder of WAV files to tune on", folder_);
         if (!f.empty()) {
             folder_ = f;
             scanFolder();
